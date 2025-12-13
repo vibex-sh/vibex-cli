@@ -337,7 +337,7 @@ async function main() {
     const localFlag = webUrl.includes('localhost') ? ' --local' : '';
     const sessionSlug = sessionId.replace(/^vibex-/, ''); // Remove prefix for example
     console.log('  💡 Tip: Use -s to send more logs to this session');
-    console.log(`  Example: echo '{"cpu": 45, "memory": 78, "timestamp": "${new Date().toISOString()}"}' | npx vibex -s ${sessionSlug}${localFlag}\n`);
+    console.log(`  Example: echo '{"cpu": 45, "memory": 78, "timestamp": "${new Date().toISOString()}"}' | npx vibex-sh -s ${sessionSlug}${localFlag}\n`);
   } else {
     // When reusing a session, show minimal info
     console.log(`  🔍 Sending logs to session: ${sessionId}`);

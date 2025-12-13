@@ -18,7 +18,7 @@ echo '{"data": 123}' | vibex --web http://localhost:3000 --socket http://localho
 ## Installation
 
 ```bash
-npm install -g vibex
+npm install -g vibex-sh
 ```
 
 ## Usage
