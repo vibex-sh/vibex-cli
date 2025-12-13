@@ -148,7 +148,7 @@ async function handleLogin(webUrl) {
   const configPath = getConfigPath();
   const existingConfig = getStoredConfig();
   
-  console.log('\n  🔐 Vibex CLI Authentication\n');
+  console.log('\n  🔐 vibex.sh CLI Authentication\n');
   console.log(`  📁 Config location: ${configPath}`);
   
   if (existingConfig?.token) {
@@ -260,7 +260,7 @@ function printBanner(sessionId, webUrl) {
   
   console.log('\n');
   console.log('  ╔═══════════════════════════════════════╗');
-  console.log('  ║         🔍 Vibex is watching...      ║');
+  console.log('  ║         🔍 vibex.sh is watching...      ║');
   console.log('  ╚═══════════════════════════════════════╝');
   console.log('\n');
   console.log(`  Session ID: ${sessionId}`);
