@@ -1,0 +1,25 @@
+# Development files
+node_modules/
+*.log
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+test/
+*.test.js
+*.spec.js
+
+# Documentation (optional - you can include README.md if you want)
+# README.md
+
+
+
