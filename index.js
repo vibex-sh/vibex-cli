@@ -3,18 +3,47 @@ import { io } from 'socket.io-client';
 import { program, Command } from 'commander';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { spawn } from 'child_process';
 import http from 'http';
 import https from 'https';
+import { fileURLToPath } from 'url';
+
+// Get version from package.json
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const packageJsonPath = join(__dirname, 'package.json');
+let cliVersion = '0.0.0';
+try {
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  cliVersion = packageJson.version || '0.0.0';
+} catch (error) {
+  // Fallback if package.json can't be read - try to read from parent directory
+  try {
+    const parentPackageJsonPath = join(__dirname, '..', 'package.json');
+    const packageJson = JSON.parse(readFileSync(parentPackageJsonPath, 'utf8'));
+    cliVersion = packageJson.version || '0.0.0';
+  } catch (e) {
+    // If both fail, use default
+  }
+}
+
+import crypto from 'crypto';
 
 function generateSessionId() {
+  // Generate secure random session ID with 12 characters (as per security plan)
+  // Format: vibex-{12 random alphanumeric chars}
+  // Using crypto for better randomness
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let result = 'vibex-';
-  for (let i = 0; i < 6; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
+  
+  // Use crypto.randomBytes for cryptographically secure random generation
+  const randomBytes = crypto.randomBytes(12);
+  for (let i = 0; i < 12; i++) {
+    result += chars[randomBytes[i] % chars.length];
   }
+  
   return result;
 }
 
@@ -235,7 +264,7 @@ function httpRequest(url, options) {
 }
 
 async function claimSession(sessionId, token, webUrl) {
-  if (!token) return false;
+  if (!token) return null; // Return null instead of false to indicate no claim attempted
   
   try {
     // Normalize session ID before claiming
@@ -249,32 +278,55 @@ async function claimSession(sessionId, token, webUrl) {
       }),
     });
     
-    return response.ok;
+    if (response.ok) {
+      // Parse response to get auth code
+      const responseData = await response.json();
+      return responseData.authCode || null;
+    }
+    
+    return null;
   } catch (error) {
-    return false;
+    return null;
   }
 }
 
-function printBanner(sessionId, webUrl) {
-  const dashboardUrl = `${webUrl}/${sessionId}`;
+// Removed getSessionAuthCode - auth codes should only come from:
+// 1. claim-session-with-token response (for claimed sessions)
+// 2. socket.io session-auth-code event (for unclaimed sessions)
+// Never fetch auth codes via public API endpoint - security vulnerability 
+
+function printBanner(sessionId, webUrl, authCode = null) {
+  const dashboardUrl = authCode 
+    ? `${webUrl}/${sessionId}?auth=${authCode}`
+    : `${webUrl}/${sessionId}`;
   
   console.log('\n');
   console.log('  ╔═══════════════════════════════════════╗');
-  console.log('  ║         🔍 vibex.sh is watching...      ║');
+  console.log('  ║         🔍 vibex.sh is watching...    ║');
   console.log('  ╚═══════════════════════════════════════╝');
   console.log('\n');
   console.log(`  Session ID: ${sessionId}`);
+  if (authCode) {
+    console.log(`  Auth Code:  ${authCode}`);
+  }
   console.log(`  Dashboard:  ${dashboardUrl}`);
   console.log('\n');
 }
 
 async function main() {
-  // Handle login command separately - check BEFORE commander parses
-  // Check process.argv directly - look for 'login' as a standalone argument
-  // This must happen FIRST, before any commander parsing
+  // Handle --version flag early (before commander parses)
   const allArgs = process.argv;
   const args = process.argv.slice(2);
   
+  // Check for --version or -V flag
+  if (allArgs.includes('--version') || allArgs.includes('-V') || args.includes('--version') || args.includes('-V')) {
+    console.log(cliVersion);
+    process.exit(0);
+  }
+  
+  // Handle login command separately - check BEFORE commander parses
+  // Check process.argv directly - look for 'login' as a standalone argument
+  // This must happen FIRST, before any commander parsing
   // Check if 'login' appears anywhere in process.argv (works with npx too)
   const hasLogin = allArgs.includes('login') || args.includes('login');
   
@@ -304,6 +356,7 @@ async function main() {
   }
 
   program
+    .version(cliVersion, '-v, --version', 'Display version number')
     .option('-s, --session-id <id>', 'Reuse existing session ID')
     .option('-l, --local', 'Use localhost (web: 3000, socket: 3001)')
     .option('--web <url>', 'Web server URL (e.g., http://localhost:3000)')
@@ -322,26 +375,39 @@ async function main() {
   // Get token from flag, env var, or stored config
   let token = options.token || process.env.VIBEX_TOKEN || await getStoredToken();
   
-  // Auto-claim session if token is available
-  if (token && !options.sessionId) {
-    // Only auto-claim new sessions (not when reusing existing session)
-    const claimed = await claimSession(sessionId, token, webUrl);
-    if (claimed) {
+  // Auto-claim session if token is available and fetch auth code
+  let authCode = null;
+  if (token) {
+    // Try to claim session (works for both new and existing sessions)
+    // For new sessions, this will create and claim
+    // For existing sessions, this will return the auth code if user owns it
+    authCode = await claimSession(sessionId, token, webUrl);
+    if (authCode && !options.sessionId) {
+      // Only show claim message for new sessions
       console.log('  ✓ Session automatically claimed to your account\n');
     }
   }
+  
+  // For unclaimed sessions, auth code will come from socket.io 'session-auth-code' event
+  // We'll set it when we receive it from the socket
 
   // Print banner only once, and show how to reuse session
   if (!options.sessionId) {
-    printBanner(sessionId, webUrl);
+    printBanner(sessionId, webUrl, authCode);
     const localFlag = webUrl.includes('localhost') ? ' --local' : '';
     const sessionSlug = sessionId.replace(/^vibex-/, ''); // Remove prefix for example
     console.log('  💡 Tip: Use -s to send more logs to this session');
-    console.log(`  Example: echo '{"cpu": 45, "memory": 78, "timestamp": "${new Date().toISOString()}"}' | npx vibex-sh -s ${sessionSlug}${localFlag}\n`);
+    console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionSlug}${localFlag}\n`);
   } else {
     // When reusing a session, show minimal info
+    const dashboardUrl = authCode 
+      ? `${webUrl}/${sessionId}?auth=${authCode}`
+      : `${webUrl}/${sessionId}`;
     console.log(`  🔍 Sending logs to session: ${sessionId}`);
-    console.log(`  Dashboard: ${webUrl}/${sessionId}\n`);
+    if (authCode) {
+      console.log(`  Auth Code: ${authCode}`);
+    }
+    console.log(`  Dashboard: ${dashboardUrl}\n`);
   }
 
   const socket = io(socketUrl, {
@@ -358,6 +424,9 @@ async function main() {
   let isConnected = false;
   let hasJoinedSession = false;
   const logQueue = [];
+
+  // Store auth code received from socket
+  let receivedAuthCode = authCode;
 
   socket.on('connect', () => {
     isConnected = true;
@@ -376,6 +445,20 @@ async function main() {
         });
       }
     }, 100);
+  });
+
+  // Listen for auth code from socket.io (for unclaimed sessions)
+  socket.on('session-auth-code', (data) => {
+    if (data.sessionId === sessionId && data.authCode) {
+      // Always update and display auth code if received from socket
+      // This ensures we show it even if we didn't get it from claimSession
+      if (!receivedAuthCode || receivedAuthCode !== data.authCode) {
+        receivedAuthCode = data.authCode;
+        // Display auth code when received (for both new and existing sessions)
+        console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
+        console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
+      }
+    }
   });
 
   socket.on('reconnect', (attemptNumber) => {
@@ -424,6 +507,48 @@ async function main() {
     if (reason === 'io server disconnect') {
       // Server disconnected, will reconnect automatically
     }
+  });
+
+  // Handle rate limit errors from server
+  socket.on('rate-limit-exceeded', (data) => {
+    console.error('\n  ⚠️  Rate Limit Exceeded');
+    console.error(`  ${data.message || 'Too many requests. Please try again later.'}`);
+    if (data.rateLimit) {
+      const { limit, remaining, resetAt, windowSeconds } = data.rateLimit;
+      if (limit !== undefined) {
+        console.error(`  Limit: ${limit} requests`);
+      }
+      if (remaining !== undefined) {
+        console.error(`  Remaining: ${remaining} requests`);
+      }
+      if (resetAt) {
+        const resetDate = new Date(resetAt);
+        const now = new Date();
+        const secondsUntilReset = Math.ceil((resetDate - now) / 1000);
+        if (secondsUntilReset > 0) {
+          console.error(`  Resets in: ${secondsUntilReset} seconds`);
+        }
+      }
+    }
+    console.error('');
+    // Don't exit - let user decide, but clear the queue
+    logQueue.length = 0;
+  });
+
+  // Handle general errors from server
+  socket.on('error', (data) => {
+    console.error('\n  ✗ Server Error');
+    if (typeof data === 'string') {
+      console.error(`  ${data}`);
+    } else if (data && data.message) {
+      console.error(`  ${data.message}`);
+      if (data.error) {
+        console.error(`  Error: ${data.error}`);
+      }
+    } else {
+      console.error('  An unexpected error occurred');
+    }
+    console.error('');
   });
 
   const rl = readline.createInterface({
