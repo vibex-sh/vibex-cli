@@ -399,15 +399,8 @@ async function main() {
     console.log('  💡 Tip: Use -s to send more logs to this session');
     console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionSlug}${localFlag}\n`);
   } else {
-    // When reusing a session, show minimal info
-    const dashboardUrl = authCode 
-      ? `${webUrl}/${sessionId}?auth=${authCode}`
-      : `${webUrl}/${sessionId}`;
-    console.log(`  🔍 Sending logs to session: ${sessionId}`);
-    if (authCode) {
-      console.log(`  Auth Code: ${authCode}`);
-    }
-    console.log(`  Dashboard: ${dashboardUrl}\n`);
+    // When reusing a session, show minimal info (no auth code)
+    console.log(`  🔍 Sending logs to session: ${sessionId}\n`);
   }
 
   const socket = io(socketUrl, {
@@ -427,23 +420,21 @@ async function main() {
 
   // Store auth code received from socket
   let receivedAuthCode = authCode;
+  
+  // Track if this is a new session (not reusing an existing one)
+  const isNewSession = !options.sessionId;
 
   socket.on('connect', () => {
     isConnected = true;
     console.log('  ✓ Connected to server\n');
-    console.error(`[CLI DEBUG] Socket connected, socket.id: ${socket.id}`);
-    console.error(`[CLI DEBUG] About to emit join-session for: ${sessionId}`);
     // Rejoin session on reconnect
     socket.emit('join-session', sessionId);
-    console.error(`[CLI DEBUG] ✅ join-session emitted, waiting 100ms before setting hasJoinedSession`);
     // Wait a tiny bit for join-session to be processed
     setTimeout(() => {
       hasJoinedSession = true;
-      console.error(`[CLI DEBUG] hasJoinedSession set to true, processing ${logQueue.length} queued logs`);
       // Process any queued logs
       while (logQueue.length > 0) {
         const logData = logQueue.shift();
-        console.error(`[CLI DEBUG] Emitting queued cli-emit (connect) for sessionId: ${sessionId}`);
         socket.emit('cli-emit', {
           sessionId,
           ...logData,
@@ -453,15 +444,17 @@ async function main() {
   });
 
   // Listen for auth code from socket.io (for unclaimed sessions)
+  // Only display auth code if this is a new session (not when reusing existing session)
   socket.on('session-auth-code', (data) => {
     if (data.sessionId === sessionId && data.authCode) {
-      // Always update and display auth code if received from socket
-      // This ensures we show it even if we didn't get it from claimSession
+      // Update received auth code
       if (!receivedAuthCode || receivedAuthCode !== data.authCode) {
         receivedAuthCode = data.authCode;
-        // Display auth code when received (for both new and existing sessions)
-        console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
-        console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
+        // Only display auth code for new sessions, not when reusing existing sessions
+        if (isNewSession) {
+          console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
+          console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
+        }
       }
     }
   });
@@ -476,7 +469,6 @@ async function main() {
       // Process any queued logs
       while (logQueue.length > 0) {
         const logData = logQueue.shift();
-        console.error(`[CLI DEBUG] Emitting queued cli-emit (reconnect) for sessionId: ${sessionId}`);
         socket.emit('cli-emit', {
           sessionId,
           ...logData,
@@ -583,10 +575,8 @@ async function main() {
   });
 
   rl.on('line', (line) => {
-    console.error(`[CLI DEBUG] Received line from stdin: "${line}"`);
     const trimmedLine = line.trim();
     if (!trimmedLine) {
-      console.error(`[CLI DEBUG] Line is empty, skipping`);
       return;
     }
 
@@ -598,31 +588,22 @@ async function main() {
         payload: parsed,
         timestamp: Date.now(),
       };
-      console.error(`[CLI DEBUG] Parsed as JSON log`);
     } catch (e) {
       logData = {
         type: 'text',
         payload: trimmedLine,
         timestamp: Date.now(),
       };
-      console.error(`[CLI DEBUG] Parsed as text log`);
     }
 
-    console.error(`[CLI DEBUG] Connection state - isConnected: ${isConnected}, hasJoinedSession: ${hasJoinedSession}, socket.connected: ${socket?.connected}`);
-    
     // If connected and joined session, send immediately; otherwise queue it
     if (isConnected && hasJoinedSession && socket.connected) {
-      console.error(`[CLI DEBUG] ✅ Ready to emit - Emitting cli-emit for sessionId: ${sessionId}`);
-      console.error(`[CLI DEBUG] Log data:`, JSON.stringify(logData, null, 2));
       socket.emit('cli-emit', {
         sessionId,
         ...logData,
       });
-      console.error(`[CLI DEBUG] ✅ cli-emit event emitted successfully`);
     } else {
-      console.error(`[CLI DEBUG] ⏸️  Queueing log - isConnected: ${isConnected}, hasJoinedSession: ${hasJoinedSession}, socket.connected: ${socket?.connected}`);
       logQueue.push(logData);
-      console.error(`[CLI DEBUG] Queue now has ${logQueue.length} items`);
     }
   });
 

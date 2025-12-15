@@ -1,6 +1,6 @@
 {
   "name": "vibex-sh",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "description": "Zero-config observability CLI - pipe logs and visualize instantly",
   "type": "module",
   "bin": {
@@ -27,6 +27,7 @@
   "homepage": "https://vibex.sh",
   "dependencies": {
     "commander": "^11.1.0",
-    "socket.io-client": "^4.7.2"
+    "socket.io-client": "^4.7.2",
+    "vibex-sh": "^0.2.3"
   }
 }
