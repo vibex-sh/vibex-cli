@@ -431,14 +431,19 @@ async function main() {
   socket.on('connect', () => {
     isConnected = true;
     console.log('  ✓ Connected to server\n');
+    console.error(`[CLI DEBUG] Socket connected, socket.id: ${socket.id}`);
+    console.error(`[CLI DEBUG] About to emit join-session for: ${sessionId}`);
     // Rejoin session on reconnect
     socket.emit('join-session', sessionId);
+    console.error(`[CLI DEBUG] ✅ join-session emitted, waiting 100ms before setting hasJoinedSession`);
     // Wait a tiny bit for join-session to be processed
     setTimeout(() => {
       hasJoinedSession = true;
+      console.error(`[CLI DEBUG] hasJoinedSession set to true, processing ${logQueue.length} queued logs`);
       // Process any queued logs
       while (logQueue.length > 0) {
         const logData = logQueue.shift();
+        console.error(`[CLI DEBUG] Emitting queued cli-emit (connect) for sessionId: ${sessionId}`);
         socket.emit('cli-emit', {
           sessionId,
           ...logData,
@@ -471,6 +476,7 @@ async function main() {
       // Process any queued logs
       while (logQueue.length > 0) {
         const logData = logQueue.shift();
+        console.error(`[CLI DEBUG] Emitting queued cli-emit (reconnect) for sessionId: ${sessionId}`);
         socket.emit('cli-emit', {
           sessionId,
           ...logData,
@@ -537,6 +543,25 @@ async function main() {
 
   // Handle general errors from server
   socket.on('error', (data) => {
+    // Check if it's a history limit error
+    if (data && data.error === 'History Limit Reached') {
+      console.error('\n  🚫 History Limit Reached');
+      console.error(`  ${data.message || 'Session history limit reached'}`);
+      if (data.limit !== undefined && data.current !== undefined) {
+        console.error(`  Current: ${data.current} / ${data.limit} logs`);
+      }
+      if (data.upgradeRequired) {
+        console.error('  💡 Upgrade to Pro to unlock 30 days retention');
+        console.error('  🌐 Visit: https://vibex.sh/pricing');
+      }
+      console.error('');
+      // Clear the queue and stop processing
+      logQueue.length = 0;
+      hasJoinedSession = false; // Prevent further logs from being sent
+      return;
+    }
+    
+    // Handle other errors
     console.error('\n  ✗ Server Error');
     if (typeof data === 'string') {
       console.error(`  ${data}`);
@@ -558,8 +583,10 @@ async function main() {
   });
 
   rl.on('line', (line) => {
+    console.error(`[CLI DEBUG] Received line from stdin: "${line}"`);
     const trimmedLine = line.trim();
     if (!trimmedLine) {
+      console.error(`[CLI DEBUG] Line is empty, skipping`);
       return;
     }
 
@@ -571,22 +598,31 @@ async function main() {
         payload: parsed,
         timestamp: Date.now(),
       };
+      console.error(`[CLI DEBUG] Parsed as JSON log`);
     } catch (e) {
       logData = {
         type: 'text',
         payload: trimmedLine,
         timestamp: Date.now(),
       };
+      console.error(`[CLI DEBUG] Parsed as text log`);
     }
 
+    console.error(`[CLI DEBUG] Connection state - isConnected: ${isConnected}, hasJoinedSession: ${hasJoinedSession}, socket.connected: ${socket?.connected}`);
+    
     // If connected and joined session, send immediately; otherwise queue it
     if (isConnected && hasJoinedSession && socket.connected) {
+      console.error(`[CLI DEBUG] ✅ Ready to emit - Emitting cli-emit for sessionId: ${sessionId}`);
+      console.error(`[CLI DEBUG] Log data:`, JSON.stringify(logData, null, 2));
       socket.emit('cli-emit', {
         sessionId,
         ...logData,
       });
+      console.error(`[CLI DEBUG] ✅ cli-emit event emitted successfully`);
     } else {
+      console.error(`[CLI DEBUG] ⏸️  Queueing log - isConnected: ${isConnected}, hasJoinedSession: ${hasJoinedSession}, socket.connected: ${socket?.connected}`);
       logQueue.push(logData);
+      console.error(`[CLI DEBUG] Queue now has ${logQueue.length} items`);
     }
   });
 
