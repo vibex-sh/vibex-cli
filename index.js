@@ -1,5 +1,4 @@
 import readline from 'readline';
-import { io } from 'socket.io-client';
 import { program, Command } from 'commander';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
@@ -9,6 +8,7 @@ import { spawn } from 'child_process';
 import http from 'http';
 import https from 'https';
 import { fileURLToPath } from 'url';
+import WebSocket from 'ws';
 
 // Get version from package.json
 const __filename = fileURLToPath(import.meta.url);
@@ -59,18 +59,20 @@ function normalizeSessionId(sessionId) {
 function deriveSocketUrl(webUrl) {
   const url = new URL(webUrl);
   
-  // For localhost, socket is typically on port 3001
+  // For localhost, use Workers dev server
   if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
-    const port = url.port === '3000' || !url.port ? '3001' : String(parseInt(url.port) + 1);
-    return `${url.protocol}//${url.hostname}:${port}`;
+    return 'ws://localhost:8787';
   } 
-  // For vibex.sh domains, use socket subdomain
+  // For vibex.sh domains, use Workers WebSocket endpoint
   else if (url.hostname.includes('vibex.sh')) {
-    return webUrl.replace(url.hostname, `socket.${url.hostname}`);
+    // Use Cloudflare Workers WebSocket endpoint
+    const workerUrl = process.env.VIBEX_WORKER_URL || 'https://vibex-ingest.your-subdomain.workers.dev';
+    return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
   } 
-  // For other domains, try to use socket subdomain
+  // For other domains, derive from web URL
   else {
-    return webUrl.replace(url.hostname, `socket.${url.hostname}`);
+    const workerUrl = process.env.VIBEX_WORKER_URL || webUrl.replace(url.hostname, `ingest.${url.hostname}`);
+    return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
   }
 }
 
@@ -97,7 +99,7 @@ function getUrls(options) {
   if (local) {
     return {
       webUrl: process.env.VIBEX_WEB_URL || 'http://localhost:3000',
-      socketUrl: process.env.VIBEX_SOCKET_URL || socket || 'http://localhost:3001',
+      socketUrl: process.env.VIBEX_SOCKET_URL || socket || 'ws://localhost:8787',
     };
   }
   
@@ -403,20 +405,13 @@ async function main() {
     console.log(`  🔍 Sending logs to session: ${sessionId}\n`);
   }
 
-  const socket = io(socketUrl, {
-    transports: ['websocket', 'polling'],
-    autoConnect: true,
-    // Reconnection settings for Cloud Run
-    reconnection: true,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 5000,
-    reconnectionAttempts: Infinity, // Keep trying forever
-    timeout: 20000,
-  });
-
+  let socket = null;
   let isConnected = false;
   let hasJoinedSession = false;
   const logQueue = [];
+  let reconnectTimeout = null;
+  let reconnectAttempts = 0;
+  const maxReconnectDelay = 5000;
 
   // Store auth code received from socket
   let receivedAuthCode = authCode;
@@ -424,149 +419,179 @@ async function main() {
   // Track if this is a new session (not reusing an existing one)
   const isNewSession = !options.sessionId;
 
-  socket.on('connect', () => {
-    isConnected = true;
-    console.log('  ✓ Connected to server\n');
-    // Rejoin session on reconnect
-    socket.emit('join-session', sessionId);
-    // Wait a tiny bit for join-session to be processed
-    setTimeout(() => {
-      hasJoinedSession = true;
-      // Process any queued logs
-      while (logQueue.length > 0) {
-        const logData = logQueue.shift();
-        socket.emit('cli-emit', {
+  const connectWebSocket = () => {
+    try {
+      socket = new WebSocket(`${socketUrl}?sessionId=${sessionId}`);
+
+      socket.onopen = () => {
+        isConnected = true;
+        console.log('  ✓ Connected to server\n');
+        reconnectAttempts = 0;
+
+        // Join session
+        socket.send(JSON.stringify({
+          type: 'join-session',
           sessionId,
-          ...logData,
-        });
-      }
-    }, 100);
-  });
+        }));
 
-  // Listen for auth code from socket.io (for unclaimed sessions)
-  // Only display auth code if this is a new session (not when reusing existing session)
-  socket.on('session-auth-code', (data) => {
-    if (data.sessionId === sessionId && data.authCode) {
-      // Update received auth code
-      if (!receivedAuthCode || receivedAuthCode !== data.authCode) {
-        receivedAuthCode = data.authCode;
-        // Only display auth code for new sessions, not when reusing existing sessions
-        if (isNewSession) {
-          console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
-          console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
+        // Wait a bit for join-session to be processed
+        setTimeout(() => {
+          hasJoinedSession = true;
+          // Process any queued logs
+          while (logQueue.length > 0) {
+            const logData = logQueue.shift();
+            // Send logs via HTTP POST (non-blocking) instead of WebSocket
+            // WebSocket is only for receiving logs
+            sendLogViaHTTP(logData);
+          }
+        }, 100);
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+
+          switch (message.type) {
+            case 'join-session-ack':
+              console.log('  ✓ Joined session\n');
+              break;
+
+            case 'session-auth-code':
+              if (message.data && message.data.sessionId === sessionId && message.data.authCode) {
+                if (!receivedAuthCode || receivedAuthCode !== message.data.authCode) {
+                  receivedAuthCode = message.data.authCode;
+                  if (isNewSession) {
+                    console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
+                    console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
+                  }
+                }
+              }
+              break;
+
+            case 'log':
+              // Logs are received via WebSocket but sent via HTTP
+              break;
+
+            case 'error':
+              if (message.error === 'Rate Limit Exceeded') {
+                console.error('\n  ⚠️  Rate Limit Exceeded');
+                console.error(`  ${message.message || 'Too many requests. Please try again later.'}`);
+                console.error('');
+                logQueue.length = 0;
+              } else if (message.error === 'History Limit Reached') {
+                console.error('\n  🚫 History Limit Reached');
+                console.error(`  ${message.message || 'Session history limit reached'}`);
+                if (message.limit !== undefined && message.current !== undefined) {
+                  console.error(`  Current: ${message.current} / ${message.limit} logs`);
+                }
+                if (message.upgradeRequired) {
+                  console.error('  💡 Upgrade to Pro to unlock 30 days retention');
+                  console.error('  🌐 Visit: https://vibex.sh/pricing');
+                }
+                console.error('');
+                logQueue.length = 0;
+                hasJoinedSession = false;
+              } else {
+                console.error('\n  ✗ Server Error');
+                console.error(`  ${message.error || message.message || 'An unexpected error occurred'}`);
+                console.error('');
+              }
+              break;
+
+            default:
+              // Ignore unknown message types
+              break;
+          }
+        } catch (error) {
+          console.error('  ✗ Error parsing message:', error.message);
         }
-      }
-    }
-  });
+      };
 
-  socket.on('reconnect', (attemptNumber) => {
-    console.log(`  ↻ Reconnected (attempt ${attemptNumber})\n`);
-    isConnected = true;
-    // Rejoin session after reconnection
-    socket.emit('join-session', sessionId);
-    setTimeout(() => {
-      hasJoinedSession = true;
-      // Process any queued logs
-      while (logQueue.length > 0) {
-        const logData = logQueue.shift();
-        socket.emit('cli-emit', {
-          sessionId,
-          ...logData,
-        });
-      }
-    }, 100);
-  });
-
-  socket.on('reconnect_attempt', (attemptNumber) => {
-    // Silent reconnection attempts - don't spam console
-  });
-
-  socket.on('reconnect_error', (error) => {
-    // Silent reconnection errors - will keep trying
-  });
-
-  socket.on('reconnect_failed', () => {
-    console.error('  ✗ Failed to reconnect after all attempts');
-    console.error('  Stream will continue, but logs may be lost until reconnection\n');
-  });
-
-  socket.on('connect_error', (error) => {
-    // Don't exit on first connection error - allow reconnection
-    if (!isConnected) {
-      console.error('  ✗ Connection error:', error.message);
-      console.error('  ↻ Retrying connection...\n');
-    }
-  });
-
-  socket.on('disconnect', (reason) => {
-    isConnected = false;
-    hasJoinedSession = false;
-    // Don't exit - allow reconnection
-    if (reason === 'io server disconnect') {
-      // Server disconnected, will reconnect automatically
-    }
-  });
-
-  // Handle rate limit errors from server
-  socket.on('rate-limit-exceeded', (data) => {
-    console.error('\n  ⚠️  Rate Limit Exceeded');
-    console.error(`  ${data.message || 'Too many requests. Please try again later.'}`);
-    if (data.rateLimit) {
-      const { limit, remaining, resetAt, windowSeconds } = data.rateLimit;
-      if (limit !== undefined) {
-        console.error(`  Limit: ${limit} requests`);
-      }
-      if (remaining !== undefined) {
-        console.error(`  Remaining: ${remaining} requests`);
-      }
-      if (resetAt) {
-        const resetDate = new Date(resetAt);
-        const now = new Date();
-        const secondsUntilReset = Math.ceil((resetDate - now) / 1000);
-        if (secondsUntilReset > 0) {
-          console.error(`  Resets in: ${secondsUntilReset} seconds`);
+      socket.onerror = (error) => {
+        if (!isConnected) {
+          console.error(`  ✗ Connection error: ${error.message || 'websocket error'}`);
+          console.error(`  ↻ Trying to connect to: ${socketUrl}`);
+          console.error('  ↻ Retrying connection...\n');
         }
-      }
-    }
-    console.error('');
-    // Don't exit - let user decide, but clear the queue
-    logQueue.length = 0;
-  });
+      };
 
-  // Handle general errors from server
-  socket.on('error', (data) => {
-    // Check if it's a history limit error
-    if (data && data.error === 'History Limit Reached') {
-      console.error('\n  🚫 History Limit Reached');
-      console.error(`  ${data.message || 'Session history limit reached'}`);
-      if (data.limit !== undefined && data.current !== undefined) {
-        console.error(`  Current: ${data.current} / ${data.limit} logs`);
-      }
-      if (data.upgradeRequired) {
-        console.error('  💡 Upgrade to Pro to unlock 30 days retention');
-        console.error('  🌐 Visit: https://vibex.sh/pricing');
-      }
-      console.error('');
-      // Clear the queue and stop processing
-      logQueue.length = 0;
-      hasJoinedSession = false; // Prevent further logs from being sent
+      socket.onclose = (event) => {
+        isConnected = false;
+        hasJoinedSession = false;
+
+        // Reconnect logic
+        if (event.code !== 1000) { // Not a normal closure
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelay);
+          reconnectAttempts++;
+          console.log(`  ↻ Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...\n`);
+          
+          reconnectTimeout = setTimeout(() => {
+            connectWebSocket();
+          }, delay);
+        }
+      };
+    } catch (error) {
+      console.error(`  ✗ Error creating WebSocket: ${error.message}`);
+      console.error(`  ↻ URL: ${socketUrl}`);
+      // Retry connection
+      reconnectTimeout = setTimeout(() => {
+        connectWebSocket();
+      }, 1000);
+    }
+  };
+
+  // Send logs via HTTP POST (non-blocking, same as SDKs)
+  // Use Cloudflare Worker endpoint (port 8787 for local, or Worker URL for production)
+  const sendLogViaHTTP = async (logData) => {
+    if (!token) {
+      console.error('  ✗ No token available for sending logs');
       return;
     }
-    
-    // Handle other errors
-    console.error('\n  ✗ Server Error');
-    if (typeof data === 'string') {
-      console.error(`  ${data}`);
-    } else if (data && data.message) {
-      console.error(`  ${data.message}`);
-      if (data.error) {
-        console.error(`  Error: ${data.error}`);
+
+    try {
+      // For local development, use Workers dev server (port 8787)
+      // For production, use Cloudflare Worker URL
+      const ingestUrl = webUrl.includes('localhost') || webUrl.includes('127.0.0.1')
+        ? 'http://localhost:8787/api/v1/ingest'
+        : process.env.VIBEX_WORKER_URL 
+          ? `${process.env.VIBEX_WORKER_URL}/api/v1/ingest`
+          : `${webUrl}/api/v1/ingest`; // Fallback to web URL (should be proxied)
+      
+      const response = await fetch(ingestUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId,
+          logs: [logData],
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        if (response.status === 429) {
+          console.error('\n  ⚠️  Rate Limit Exceeded');
+          console.error(`  ${errorData.message || 'Too many requests. Please try again later.'}`);
+          console.error('');
+        } else if (response.status === 403 && errorData.message?.includes('History Limit')) {
+          console.error('\n  🚫 History Limit Reached');
+          console.error(`  ${errorData.message || 'Session history limit reached'}`);
+          if (errorData.upgradeRequired) {
+            console.error('  💡 Upgrade to Pro to unlock 30 days retention');
+            console.error('  🌐 Visit: https://vibex.sh/pricing');
+          }
+          console.error('');
+        }
       }
-    } else {
-      console.error('  An unexpected error occurred');
+    } catch (error) {
+      console.error('  ✗ Error sending log:', error.message);
     }
-    console.error('');
-  });
+  };
+
+  // Start WebSocket connection
+  connectWebSocket();
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -596,29 +621,25 @@ async function main() {
       };
     }
 
-    // If connected and joined session, send immediately; otherwise queue it
-    if (isConnected && hasJoinedSession && socket.connected) {
-      socket.emit('cli-emit', {
-        sessionId,
-        ...logData,
-      });
+    // Send logs via HTTP POST (non-blocking, same as SDKs)
+    // WebSocket is only for receiving logs and auth codes
+    if (hasJoinedSession) {
+      sendLogViaHTTP(logData);
     } else {
       logQueue.push(logData);
     }
   });
 
   rl.on('close', () => {
-    // Wait for connection and queued logs to be sent
+    // Wait for queued logs to be sent
     const waitForQueue = () => {
-      if (logQueue.length === 0 || (!isConnected && logQueue.length > 0)) {
-        // If not connected and we have queued logs, wait a bit more
-        if (!isConnected && logQueue.length > 0) {
-          setTimeout(waitForQueue, 200);
-          return;
-        }
+      if (logQueue.length === 0) {
         console.log('\n  Stream ended. Closing connection...\n');
-        if (socket.connected) {
-          socket.disconnect();
+        if (socket && socket.readyState === 1) { // WebSocket.OPEN = 1
+          socket.close(1000, 'Stream ended');
+        }
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
         }
         setTimeout(() => process.exit(0), 100);
       } else {
@@ -631,7 +652,12 @@ async function main() {
 
   process.on('SIGINT', () => {
     console.log('\n  Interrupted. Closing connection...\n');
-    socket.disconnect();
+    if (socket && socket.readyState === 1) { // WebSocket.OPEN = 1
+      socket.close(1000, 'Interrupted');
+    }
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+    }
     process.exit(0);
   });
 }
