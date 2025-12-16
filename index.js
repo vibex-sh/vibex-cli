@@ -66,7 +66,7 @@ function deriveSocketUrl(webUrl) {
   // For vibex.sh domains, use Workers WebSocket endpoint
   else if (url.hostname.includes('vibex.sh')) {
     // Use Cloudflare Workers WebSocket endpoint
-    const workerUrl = process.env.VIBEX_WORKER_URL || 'https://vibex-ingest.prop.workers.dev';
+    const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
     return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
   } 
   // For other domains, derive from web URL
@@ -113,7 +113,7 @@ function getUrls(options) {
   
   // Priority 5: Production defaults
   // Use Worker WebSocket endpoint instead of old Socket.io server
-  const defaultWorkerUrl = process.env.VIBEX_WORKER_URL || 'https://vibex-ingest.prop.workers.dev';
+  const defaultWorkerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
   return {
     webUrl: 'https://vibex.sh',
     socketUrl: socket || defaultWorkerUrl.replace('https://', 'wss://').replace('http://', 'ws://'),
@@ -437,19 +437,104 @@ async function main() {
   let reconnectAttempts = 0;
   const maxReconnectDelay = 5000;
 
+  // Connection state management
+  let connectionState = 'disconnected'; // disconnected, connecting, connected, closing, closed
+  let connectionEstablished = false;
+  let connectionLock = false;
+  let connectionStartTime = null;
+
   // Store auth code received from socket
   let receivedAuthCode = authCode;
   
   // Track if this is a new session (not reusing an existing one)
   const isNewSession = !options.sessionId;
 
+  // Graceful shutdown function
+  const closeWebSocket = () => {
+    return new Promise((resolve) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        if (connectionState === 'connected' || connectionState === 'closing') {
+          connectionState = 'closed';
+        }
+        resolve();
+        return;
+      }
+      
+      connectionState = 'closing';
+      const closeStartTime = Date.now();
+      console.log('  🔄 Initiating graceful WebSocket close...');
+      
+      const closeTimeout = setTimeout(() => {
+        const elapsed = Date.now() - closeStartTime;
+        console.log(`  ⚠️  Close handshake timeout after ${elapsed}ms, forcing exit`);
+        connectionState = 'closed';
+        resolve();
+      }, 2000);
+      
+      // Store original onclose handler
+      const originalOnClose = socket.onclose;
+      
+      socket.onclose = (event) => {
+        clearTimeout(closeTimeout);
+        const elapsed = Date.now() - closeStartTime;
+        connectionState = 'closed';
+        connectionEstablished = false;
+        console.log(`  ✓ WebSocket closed gracefully (code: ${event.code}, reason: ${event.reason || 'none'}, time: ${elapsed}ms)`);
+        
+        // Call original handler if it exists
+        if (originalOnClose) {
+          originalOnClose(event);
+        }
+        
+        resolve();
+      };
+      
+      socket.close(1000, 'Stream ended');
+    });
+  };
+
   const connectWebSocket = () => {
+    // Prevent multiple simultaneous connections
+    if (connectionLock) {
+      console.log('  ⚠️  Connection already in progress, skipping...');
+      return;
+    }
+    
+    if (connectionState === 'connected' || connectionState === 'connecting') {
+      console.log(`  ⚠️  Already ${connectionState}, skipping new connection...`);
+      return;
+    }
+    
+    // Clear any existing reconnect timeout to prevent duplicate connections
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+    
+    connectionLock = true;
+    connectionState = 'connecting';
+    connectionStartTime = Date.now();
+    console.log('  🔄 Connecting to WebSocket...');
+    
     try {
+      // Close existing socket if any (cleanup)
+      if (socket && socket.readyState !== WebSocket.CLOSED) {
+        try {
+          socket.close();
+        } catch (e) {
+          // Ignore errors when closing
+        }
+      }
+      
       socket = new WebSocket(`${socketUrl}?sessionId=${sessionId}`);
 
       socket.onopen = () => {
+        const connectTime = Date.now() - connectionStartTime;
+        connectionLock = false;
+        connectionState = 'connected';
         isConnected = true;
-        console.log('  ✓ Connected to server\n');
+        connectionEstablished = true;
+        console.log(`  ✓ Connected to server (${connectTime}ms)\n`);
         reconnectAttempts = 0;
 
         // Join session
@@ -605,11 +690,17 @@ async function main() {
       };
 
       socket.onclose = (event) => {
+        connectionLock = false;
+        connectionState = 'closed';
+        connectionEstablished = false;
         isConnected = false;
         hasJoinedSession = false;
+        
+        const connectionDuration = connectionStartTime ? Date.now() - connectionStartTime : 0;
+        console.log(`  📊 Connection closed (code: ${event.code}, reason: ${event.reason || 'none'}, duration: ${connectionDuration}ms)`);
 
-        // Reconnect logic
-        if (event.code !== 1000) { // Not a normal closure
+        // Reconnect logic - only if not a normal closure and not already closing
+        if (event.code !== 1000 && connectionState !== 'closing') {
           const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelay);
           reconnectAttempts++;
           console.log(`  ↻ Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...\n`);
@@ -617,9 +708,14 @@ async function main() {
           reconnectTimeout = setTimeout(() => {
             connectWebSocket();
           }, delay);
+        } else if (event.code === 1000) {
+          console.log('  ✓ Normal closure, no reconnect needed\n');
         }
       };
     } catch (error) {
+      connectionLock = false;
+      connectionState = 'disconnected';
+      connectionEstablished = false;
       console.error(`  ✗ Error creating WebSocket: ${error.message}`);
       console.error(`  ↻ URL: ${socketUrl}`);
       // Retry connection
@@ -645,7 +741,7 @@ async function main() {
         ingestUrl = `${process.env.VIBEX_WORKER_URL}/api/v1/ingest`;
       } else {
         // Production default - use Worker URL (not web URL)
-        const defaultWorkerUrl = 'https://vibex-ingest.prop.workers.dev';
+        const defaultWorkerUrl = 'https://ingest.vibex.sh';
         ingestUrl = `${defaultWorkerUrl}/api/v1/ingest`;
       }
             
@@ -792,34 +888,47 @@ async function main() {
     sendLogViaHTTP(logData);
   });
 
-  rl.on('close', () => {
+  rl.on('close', async () => {
     // Wait for queued logs to be sent
     const waitForQueue = () => {
-      if (logQueue.length === 0) {
-        console.log('\n  Stream ended. Closing connection...\n');
-        if (socket && socket.readyState === 1) { // WebSocket.OPEN = 1
-          socket.close(1000, 'Stream ended');
+      return new Promise((resolve) => {
+        if (logQueue.length === 0) {
+          resolve();
+        } else {
+          setTimeout(() => waitForQueue().then(resolve), 100);
         }
-        if (reconnectTimeout) {
-          clearTimeout(reconnectTimeout);
-        }
-        setTimeout(() => process.exit(0), 100);
-      } else {
-        setTimeout(waitForQueue, 100);
-      }
+      });
     };
     
-    waitForQueue();
-  });
-
-  process.on('SIGINT', () => {
-    console.log('\n  Interrupted. Closing connection...\n');
-    if (socket && socket.readyState === 1) { // WebSocket.OPEN = 1
-      socket.close(1000, 'Interrupted');
-    }
+    await waitForQueue();
+    
+    console.log('\n  Stream ended. Closing connection...\n');
+    
+    // Cancel any pending reconnection attempts
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
     }
+    
+    // Graceful shutdown - wait for close handshake
+    await closeWebSocket();
+    
+    // Give a moment for any final cleanup
+    setTimeout(() => process.exit(0), 100);
+  });
+
+  process.on('SIGINT', async () => {
+    console.log('\n  Interrupted. Closing connection...\n');
+    
+    // Cancel any pending reconnection attempts
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+    
+    // Graceful shutdown
+    await closeWebSocket();
+    
     process.exit(0);
   });
 }
