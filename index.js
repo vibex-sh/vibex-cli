@@ -56,6 +56,103 @@ function normalizeSessionId(sessionId) {
   return sessionId;
 }
 
+/**
+ * Phase 1.8: Log Normalization for CLI
+ * Intelligently transforms log data into hybrid JSON structure
+ */
+
+function normalizeLevel(level) {
+  if (!level) return 'debug';
+  const levelStr = String(level).toLowerCase();
+  if (['debug', 'dbg', 'trace'].includes(levelStr)) return 'debug';
+  if (['info', 'information', 'log'].includes(levelStr)) return 'info';
+  if (['warn', 'warning', 'wrn'].includes(levelStr)) return 'warn';
+  if (['error', 'err', 'exception', 'fatal', 'critical'].includes(levelStr)) return 'error';
+  return 'debug';
+}
+
+function extractMetrics(payload) {
+  const metrics = {};
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return metrics;
+  }
+  if (payload.metrics && typeof payload.metrics === 'object' && !Array.isArray(payload.metrics)) {
+    for (const [key, value] of Object.entries(payload.metrics)) {
+      if (typeof value === 'number') {
+        metrics[key] = value;
+      }
+    }
+    return metrics;
+  }
+  const knownContextFields = new Set([
+    'trace_id', 'traceId', 'user_id', 'userId', 'request_id', 'requestId',
+    'correlation_id', 'correlationId', 'span_id', 'spanId', 'session_id', 'sessionId',
+    'id', 'pid', 'port', 'year', 'timestamp', 'time', 'date', 'createdAt', 'updatedAt',
+    'datetime', 'ts', 'utc', 'iso', 'exc_info', 'exception', 'error', 'message', 'msg', 'level', 'severity', 'log_level'
+  ]);
+  for (const [key, value] of Object.entries(payload)) {
+    const keyLower = key.toLowerCase();
+    if (knownContextFields.has(keyLower)) continue;
+    if (keyLower.includes('timestamp') || keyLower.includes('time') || keyLower.includes('date')) continue;
+    if (typeof value === 'number') {
+      if (key.endsWith('_ms') || key.endsWith('_count') || key.endsWith('_size') ||
+          key.endsWith('Ms') || key.endsWith('Count') || key.endsWith('Size') ||
+          ['cpu', 'memory', 'latency', 'response_time', 'duration'].some(pattern => keyLower.includes(pattern))) {
+        metrics[key] = value;
+      }
+    }
+  }
+  return metrics;
+}
+
+function extractContext(payload) {
+  const context = {};
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return context;
+  }
+  if (payload.context && typeof payload.context === 'object' && !Array.isArray(payload.context)) {
+    return payload.context;
+  }
+  const knownContextFields = {
+    'trace_id': 'trace_id', 'traceId': 'trace_id',
+    'user_id': 'user_id', 'userId': 'user_id',
+    'request_id': 'request_id', 'requestId': 'request_id',
+    'correlation_id': 'correlation_id', 'correlationId': 'correlation_id',
+    'span_id': 'span_id', 'spanId': 'span_id',
+    'session_id': 'session_id', 'sessionId': 'session_id',
+  };
+  for (const [field, normalizedKey] of Object.entries(knownContextFields)) {
+    if (payload[field] !== undefined) {
+      context[normalizedKey] = payload[field];
+    }
+  }
+  return context;
+}
+
+function normalizeToHybrid(message, level, payload) {
+  const merged = { ...(payload || {}) };
+  let normalizedMessage = message;
+  if (!normalizedMessage && merged.message) normalizedMessage = merged.message;
+  if (!normalizedMessage && merged.msg) normalizedMessage = merged.msg;
+  const normalizedLevel = normalizeLevel(level || merged.level || merged.severity || merged.log_level);
+  const metrics = extractMetrics(merged);
+  const context = extractContext(merged);
+  const annotation = merged._annotation;
+  const hybrid = {
+    message: normalizedMessage, // Can be null/undefined
+    level: normalizedLevel,
+    metrics: metrics,
+    context: context,
+  };
+  if (annotation) hybrid._annotation = annotation;
+  for (const [key, value] of Object.entries(merged)) {
+    if (!['message', 'msg', 'level', 'severity', 'log_level', 'metrics', 'context', '_annotation'].includes(key)) {
+      if (!(key in hybrid)) hybrid[key] = value;
+    }
+  }
+  return hybrid;
+}
+
 function deriveSocketUrl(webUrl) {
   const url = new URL(webUrl);
   
@@ -870,15 +967,37 @@ async function main() {
     let logData;
     try {
       const parsed = JSON.parse(trimmedLine);
+      // Phase 1.8: Normalize JSON to hybrid structure
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        const hybrid = normalizeToHybrid(null, null, parsed);
+        logData = {
+          type: 'json',
+          payload: hybrid,
+          timestamp: Date.now(),
+        };
+      } else {
+        // Parsed but not an object - treat as text
+        logData = {
+          type: 'json',
+          payload: {
+            message: trimmedLine,
+            level: 'debug',
+            metrics: {},
+            context: {},
+          },
+          timestamp: Date.now(),
+        };
+      }
+    } catch (e) {
+      // Phase 1.8: Text logs are now valuable - send as message field
       logData = {
         type: 'json',
-        payload: parsed,
-        timestamp: Date.now(),
-      };
-    } catch (e) {
-      logData = {
-        type: 'text',
-        payload: trimmedLine,
+        payload: {
+          message: trimmedLine,
+          level: 'debug',
+          metrics: {},
+          context: {},
+        },
         timestamp: Date.now(),
       };
     }
