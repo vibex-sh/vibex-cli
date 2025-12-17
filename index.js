@@ -517,9 +517,8 @@ async function main() {
       // Print banner for new session
       printBanner(sessionId, webUrl, authCode);
       const localFlag = webUrl.includes('localhost') ? ' --local' : '';
-      const sessionSlug = sessionId.replace(/^vibex-/, ''); // Remove prefix for example
       console.log('  💡 Tip: Use -s to send more logs to this session');
-      console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionSlug}${localFlag}\n`);
+      console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionId}${localFlag}\n`);
     } catch (error) {
       console.error(`  ✗ Error creating session: ${error.message}`);
       process.exit(1);
