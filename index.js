@@ -403,6 +403,139 @@ async function main() {
     process.exit(0);
   }
   
+  // Handle init command - check for 'init' command
+  const hasInit = allArgs.includes('init') || args.includes('init');
+  
+  if (hasInit) {
+    // Find init position to get args after it
+    const initIndex = args.indexOf('init');
+    const initArgs = initIndex !== -1 ? args.slice(initIndex + 1) : [];
+    
+    // Create a separate command instance for init
+    const initCmd = new Command();
+    initCmd
+      .option('--web <url>', 'Web server URL')
+      .option('--server <url>', 'Shorthand for --web')
+      .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres)')
+      .option('--parsers <parsers>', 'Alias for --parser');
+    
+    // Parse only the options (args after 'init')
+    if (initArgs.length > 0) {
+      initCmd.parse(['node', 'vibex', ...initArgs], { from: 'user' });
+    } else {
+      initCmd.parse(['node', 'vibex'], { from: 'user' });
+    }
+    
+    const options = initCmd.opts();
+    const { webUrl } = getUrls(options);
+    
+    // Interactive prompt for parser selection
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    
+    const question = (query) => new Promise((resolve) => rl.question(query, resolve));
+    
+    try {
+      console.log('\n  🔧 vibex.sh Session Initialization\n');
+      
+      // Fetch available parsers from worker
+      const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
+      let availableParsers = [];
+      try {
+        const parsersResponse = await httpRequest(`${workerUrl}/internal/parsers`, {
+          method: 'GET',
+          headers: {
+            'X-Internal-API-Secret': process.env.INTERNAL_API_SECRET || '',
+          },
+        });
+        if (parsersResponse.ok) {
+          availableParsers = await parsersResponse.json();
+        }
+      } catch (e) {
+        // Fallback to hardcoded list if API fails
+        availableParsers = [
+          { id: 'nginx', name: 'Nginx Access Log', category: 'web' },
+          { id: 'apache', name: 'Apache Access Log', category: 'web' },
+          { id: 'docker', name: 'Docker Container Logs', category: 'system' },
+          { id: 'kubernetes', name: 'Kubernetes Pod/Container Logs', category: 'system' },
+        ];
+      }
+      
+      // Filter out mandatory parsers for selection
+      const selectableParsers = availableParsers.filter(p => !p.isMandatory);
+      
+      console.log('  What kind of logs are these? (Optional - leave empty for auto-detection)');
+      console.log('  Available log types:');
+      selectableParsers.forEach((p, i) => {
+        console.log(`    ${i + 1}. ${p.name} (${p.id})`);
+      });
+      console.log('    (Leave empty for auto-detection)\n');
+      
+      const answer = await question('  Enter comma-separated numbers or parser IDs (e.g., 1,2 or nginx,apache): ');
+      rl.close();
+      
+      let enabledParsers = [];
+      if (answer.trim()) {
+        const selections = answer.split(',').map(s => s.trim());
+        selections.forEach(sel => {
+          // Check if it's a number
+          const num = parseInt(sel, 10);
+          if (!isNaN(num) && num > 0 && num <= selectableParsers.length) {
+            enabledParsers.push(selectableParsers[num - 1].id);
+          } else if (selectableParsers.find(p => p.id === sel)) {
+            enabledParsers.push(sel);
+          }
+        });
+      }
+      
+      // Use parser flag if provided, otherwise use interactive selection
+      const parserFlag = options.parser || options.parsers;
+      if (parserFlag) {
+        if (typeof parserFlag === 'string') {
+          enabledParsers = parserFlag.split(',').map(p => p.trim());
+        }
+      }
+      
+      // Create session with enabledParsers
+      const createUrl = `${webUrl}/api/sessions/create-anonymous`;
+      const response = await httpRequest(createUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
+        }),
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error(`\n  ✗ Failed to create session: ${errorData.message || 'Unknown error'}`);
+        process.exit(1);
+      }
+      
+      const data = await response.json();
+      const createdSessionId = data.sessionId;
+      const createdAuthCode = data.authCode;
+      
+      console.log('\n  ✅ Session created successfully!\n');
+      printBanner(createdSessionId, webUrl, createdAuthCode);
+      if (enabledParsers.length > 0) {
+        console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
+      } else {
+        console.log('  📋 Log Types: Auto-detection (all parsers)');
+      }
+      console.log(`\n  💡 Use this session ID: ${createdSessionId}`);
+      console.log(`  Example: echo '{"cpu": 45}' | npx vibex-sh -s ${createdSessionId}\n`);
+      
+      process.exit(0);
+    } catch (error) {
+      rl.close();
+      console.error(`\n  ✗ Error: ${error.message}`);
+      process.exit(1);
+    }
+  }
+
   // Handle login command separately - check BEFORE commander parses
   // Check process.argv directly - look for 'login' as a standalone argument
   // This must happen FIRST, before any commander parsing
@@ -440,6 +573,8 @@ async function main() {
     .option('--socket <url>', 'Socket server URL')
     .option('--server <url>', 'Shorthand for --web (auto-derives socket URL)')
     .option('--token <token>', 'Authentication token (or use VIBEX_TOKEN env var)')
+    .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres). Use --parser help to see available parsers.')
+    .option('--parsers <parsers>', 'Alias for --parser')
     .parse();
 
   const options = program.opts();
@@ -464,11 +599,25 @@ async function main() {
     console.log(`  🔍 Sending logs to session: ${sessionId}\n`);
   } else {
     // No session ID provided - create a new anonymous session
+    // Check for --parser or --parsers flag for parser selection
+    let enabledParsers = [];
+    if (options.parser || options.parsers) {
+      const parserList = options.parser || options.parsers;
+      if (Array.isArray(parserList)) {
+        enabledParsers = parserList;
+      } else if (typeof parserList === 'string') {
+        enabledParsers = parserList.split(',').map(p => p.trim());
+      }
+    }
+    
     try {
       const createUrl = `${webUrl}/api/sessions/create-anonymous`;
       const response = await httpRequest(createUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
+        }),
       });
       
       if (!response.ok) {
@@ -492,6 +641,9 @@ async function main() {
       
       // Print banner for new session
       printBanner(sessionId, webUrl, authCode);
+      if (enabledParsers.length > 0) {
+        console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
+      }
       console.log('  💡 Tip: Use -s to send more logs to this session');
       console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionId}\n`);
     } catch (error) {
