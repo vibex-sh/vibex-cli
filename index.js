@@ -154,27 +154,13 @@ function normalizeToHybrid(message, level, payload) {
 }
 
 function deriveSocketUrl(webUrl) {
-  const url = new URL(webUrl);
-  
-  // For localhost, use Workers dev server
-  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
-    return 'ws://localhost:8787';
-  } 
-  // For vibex.sh domains, use Workers WebSocket endpoint
-  else if (url.hostname.includes('vibex.sh')) {
-    // Use Cloudflare Workers WebSocket endpoint
-    const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
-    return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
-  } 
-  // For other domains, derive from web URL
-  else {
-    const workerUrl = process.env.VIBEX_WORKER_URL || webUrl.replace(url.hostname, `ingest.${url.hostname}`);
-    return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
-  }
+  // Always use production worker WebSocket endpoint
+  const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
+  return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
 }
 
 function getUrls(options) {
-  const { local, web, socket, server } = options;
+  const { web, socket, server } = options;
   
   // Priority 1: Explicit --web and --socket flags (highest priority)
   if (web) {
@@ -192,15 +178,7 @@ function getUrls(options) {
     };
   }
   
-  // Priority 3: --local flag
-  if (local) {
-    return {
-      webUrl: process.env.VIBEX_WEB_URL || 'http://localhost:3000',
-      socketUrl: process.env.VIBEX_SOCKET_URL || socket || 'ws://localhost:8787',
-    };
-  }
-  
-  // Priority 4: Environment variables
+  // Priority 3: Environment variables
   if (process.env.VIBEX_WEB_URL) {
     return {
       webUrl: process.env.VIBEX_WEB_URL,
@@ -208,8 +186,8 @@ function getUrls(options) {
     };
   }
   
-  // Priority 5: Production defaults
-  // Use Worker WebSocket endpoint instead of old Socket.io server
+  // Priority 4: Production defaults
+  // Always use production worker WebSocket endpoint
   const defaultWorkerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
   return {
     webUrl: 'https://vibex.sh',
@@ -439,7 +417,6 @@ async function main() {
     // Create a separate command instance for login
     const loginCmd = new Command();
     loginCmd
-      .option('-l, --local', 'Use localhost')
       .option('--web <url>', 'Web server URL')
       .option('--server <url>', 'Shorthand for --web');
     
@@ -459,9 +436,8 @@ async function main() {
   program
     .version(cliVersion, '-v, --version', 'Display version number')
     .option('-s, --session-id <id>', 'Reuse existing session ID')
-    .option('-l, --local', 'Use localhost (web: 3000, socket: 3001)')
-    .option('--web <url>', 'Web server URL (e.g., http://localhost:3000)')
-    .option('--socket <url>', 'Socket server URL (e.g., http://localhost:3001)')
+    .option('--web <url>', 'Web server URL')
+    .option('--socket <url>', 'Socket server URL')
     .option('--server <url>', 'Shorthand for --web (auto-derives socket URL)')
     .option('--token <token>', 'Authentication token (or use VIBEX_TOKEN env var)')
     .parse();
@@ -516,9 +492,8 @@ async function main() {
       
       // Print banner for new session
       printBanner(sessionId, webUrl, authCode);
-      const localFlag = webUrl.includes('localhost') ? ' --local' : '';
       console.log('  💡 Tip: Use -s to send more logs to this session');
-      console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionId}${localFlag}\n`);
+      console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionId}\n`);
     } catch (error) {
       console.error(`  ✗ Error creating session: ${error.message}`);
       process.exit(1);
@@ -822,24 +797,14 @@ async function main() {
   };
 
   // Send logs via HTTP POST (non-blocking, same as SDKs)
-  // Use Cloudflare Worker endpoint (port 8787 for local, or Worker URL for production)
+  // Always use production Cloudflare Worker endpoint
   // Token is optional - anonymous sessions can send logs without authentication
   // HTTP POST works independently of WebSocket - don't wait for WebSocket connection
   const sendLogViaHTTP = async (logData) => {
     try {
-      // Determine ingest URL
-      let ingestUrl;
-      if (webUrl.includes('localhost') || webUrl.includes('127.0.0.1')) {
-        // Local development - use Workers dev server
-        ingestUrl = 'http://localhost:8787/api/v1/ingest';
-      } else if (process.env.VIBEX_WORKER_URL) {
-        // Use explicit Worker URL if set
-        ingestUrl = `${process.env.VIBEX_WORKER_URL}/api/v1/ingest`;
-      } else {
-        // Production default - use Worker URL (not web URL)
-        const defaultWorkerUrl = 'https://ingest.vibex.sh';
-        ingestUrl = `${defaultWorkerUrl}/api/v1/ingest`;
-      }
+      // Always use production worker URL
+      const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
+      const ingestUrl = `${workerUrl}/api/v1/ingest`;
             
       // Build headers - only include Authorization if token exists
       const headers = {

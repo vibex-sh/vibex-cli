@@ -7,12 +7,6 @@ Zero-config observability CLI - pipe logs and visualize instantly.
 ```bash
 # Production (default)
 echo '{"cpu": 45, "memory": 78}' | vibex
-
-# Local development
-echo '{"test": 123}' | vibex --local
-
-# Custom ports
-echo '{"data": 123}' | vibex --web http://localhost:3000 --socket http://localhost:8080
 ```
 
 ## Installation
@@ -43,40 +37,33 @@ echo '{"more": "data"}' | vibex --session-id vibex-abc123
 | Flag | Description | Example |
 |------|-------------|---------|
 | `-s, --session-id <id>` | Reuse existing session | `vibex --session-id vibex-abc123` |
-| `-l, --local` | Use localhost (web: 3000, socket: 3001) | `vibex --local` |
-| `--web <url>` | Web server URL | `vibex --web http://localhost:3000` |
-| `--socket <url>` | Socket server URL | `vibex --socket http://localhost:8080` |
-| `--server <url>` | Shorthand for `--web` (auto-derives socket) | `vibex --server http://localhost:3000` |
+| `--web <url>` | Web server URL | `vibex --web https://vibex.sh` |
+| `--socket <url>` | Socket server URL | `vibex --socket wss://ingest.vibex.sh` |
+| `--server <url>` | Shorthand for `--web` (auto-derives socket) | `vibex --server https://vibex.sh` |
 
 ## Server Configuration
 
 The CLI automatically derives the socket URL from the web URL, but you can override it:
 
 ```bash
-# Auto-derive socket (localhost:3000 → localhost:3001)
-vibex --web http://localhost:3000
-
-# Explicit socket URL
-vibex --web http://localhost:3000 --socket http://localhost:8080
-
-# Production (auto-derives socket.vibex.sh)
+# Production (auto-derives socket URL)
 vibex --server https://vibex.sh
 
 # Custom domain
-vibex --web https://staging.vibex.sh --socket https://socket-staging.vibex.sh
+vibex --web https://staging.vibex.sh --socket wss://ingest-staging.vibex.sh
 ```
 
 ## Priority Order
 
-1. **Flags** (`--web`, `--socket`, `--local`, `--server`)
+1. **Flags** (`--web`, `--socket`, `--server`)
 2. **Environment variables** (`VIBEX_WEB_URL`, `VIBEX_SOCKET_URL`)
-3. **Production defaults** (`https://vibex.sh`, `https://socket.vibex.sh`)
+3. **Production defaults** (`https://vibex.sh`, `wss://ingest.vibex.sh`)
 
 ## Environment Variables
 
 ```bash
-export VIBEX_WEB_URL=http://localhost:3000
-export VIBEX_SOCKET_URL=http://localhost:8080
+export VIBEX_WEB_URL=https://vibex.sh
+export VIBEX_SOCKET_URL=wss://ingest.vibex.sh
 ```
 
 ## Examples
@@ -85,14 +72,8 @@ export VIBEX_SOCKET_URL=http://localhost:8080
 # Production (default)
 echo '{"data": 123}' | vibex
 
-# Quick localhost
-echo '{"data": 123}' | vibex --local
-
 # Custom web server, auto socket
-echo '{"data": 123}' | vibex --server http://localhost:3000
-
-# Both custom
-echo '{"data": 123}' | vibex --web http://localhost:3000 --socket http://localhost:8080
+echo '{"data": 123}' | vibex --server https://vibex.sh
 
 # Staging
 echo '{"data": 123}' | vibex --server https://staging.vibex.sh

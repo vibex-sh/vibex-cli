@@ -1,6 +1,6 @@
 {
   "name": "vibex-sh",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Zero-config observability CLI - pipe logs and visualize instantly",
   "type": "module",
   "bin": {
