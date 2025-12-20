@@ -11,6 +11,13 @@ import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import crypto from 'crypto';
 
+// Constants
+const POLL_INTERVAL_MS = 1000;
+const MAX_POLL_ATTEMPTS = 60;
+const WEBSOCKET_CLOSE_TIMEOUT_MS = 2000;
+const DEFAULT_WORKER_URL = 'https://ingest.vibex.sh';
+const DEFAULT_WEB_URL = 'https://vibex.sh';
+
 // Get version from package.json
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -153,45 +160,16 @@ function normalizeToHybrid(message, level, payload) {
   return hybrid;
 }
 
-function deriveSocketUrl(webUrl) {
+/**
+ * Get production URLs
+ * CLI only supports production server
+ */
+function getProductionUrls() {
   // Always use production worker WebSocket endpoint
-  const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
-  return workerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
-}
-
-function getUrls(options) {
-  const { web, socket, server } = options;
-  
-  // Priority 1: Explicit --web and --socket flags (highest priority)
-  if (web) {
-    return {
-      webUrl: web,
-      socketUrl: socket || deriveSocketUrl(web),
-    };
-  }
-  
-  // Priority 2: --server flag (shorthand for --web)
-  if (server) {
-    return {
-      webUrl: server,
-      socketUrl: socket || deriveSocketUrl(server),
-    };
-  }
-  
-  // Priority 3: Environment variables
-  if (process.env.VIBEX_WEB_URL) {
-    return {
-      webUrl: process.env.VIBEX_WEB_URL,
-      socketUrl: process.env.VIBEX_SOCKET_URL || socket || deriveSocketUrl(process.env.VIBEX_WEB_URL),
-    };
-  }
-  
-  // Priority 4: Production defaults
-  // Always use production worker WebSocket endpoint
-  const defaultWorkerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
+  const workerUrl = process.env.VIBEX_WORKER_URL || DEFAULT_WORKER_URL;
   return {
-    webUrl: 'https://vibex.sh',
-    socketUrl: socket || defaultWorkerUrl.replace('https://', 'wss://').replace('http://', 'ws://'),
+    webUrl: DEFAULT_WEB_URL,
+    socketUrl: workerUrl.replace('https://', 'wss://').replace('http://', 'ws://'),
   };
 }
 
@@ -230,7 +208,7 @@ function getStoredConfig() {
   return null;
 }
 
-async function storeToken(token, webUrl = null) {
+async function storeToken(token) {
   try {
     const configPath = getConfigPath();
     const configDir = join(homedir(), '.vibex');
@@ -240,7 +218,6 @@ async function storeToken(token, webUrl = null) {
     
     const config = {
       token,
-      ...(webUrl && { webUrl }), // Store webUrl if provided
       updatedAt: new Date().toISOString(),
     };
     
@@ -252,9 +229,10 @@ async function storeToken(token, webUrl = null) {
   }
 }
 
-async function handleLogin(webUrl) {
+async function handleLogin() {
   const configPath = getConfigPath();
   const existingConfig = getStoredConfig();
+  const { webUrl } = getProductionUrls();
   
   console.log('\n  🔐 vibex.sh CLI Authentication\n');
   console.log(`  📁 Config location: ${configPath}`);
@@ -263,8 +241,9 @@ async function handleLogin(webUrl) {
     console.log(`  ⚠️  You already have a token stored. This will replace it.\n`);
   }
   
-  const tempToken = `temp_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const authUrl = `${webUrl}/api/cli-auth?token=${tempToken}`;
+  // Generate unique state (nonce) for OAuth flow
+  const state = crypto.randomBytes(16).toString('hex');
+  const authUrl = `${webUrl}/api/cli-auth?state=${state}`;
   
   console.log('  Opening browser for authentication...\n');
   console.log(`  If browser doesn't open, visit: ${authUrl}\n`);
@@ -284,21 +263,20 @@ async function handleLogin(webUrl) {
   
   // Poll for token
   console.log('  Waiting for authentication...');
-  const maxAttempts = 60; // 60 seconds
   let attempts = 0;
   
-  while (attempts < maxAttempts) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
+  while (attempts < MAX_POLL_ATTEMPTS) {
+    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
     attempts++;
     
     try {
-      const response = await httpRequest(`${webUrl}/api/cli-auth?token=${tempToken}`, {
+      const response = await httpRequest(`${webUrl}/api/cli-auth?state=${state}`, {
         method: 'GET',
       });
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.token) {
-          await storeToken(data.token, webUrl);
+          await storeToken(data.token);
           const configPath = getConfigPath();
           console.log('\n  ✅ Authentication successful!');
           console.log(`  📁 Token saved to: ${configPath}`);
@@ -342,39 +320,16 @@ function httpRequest(url, options) {
   });
 }
 
-async function claimSession(sessionId, token, webUrl) {
-  if (!token) return null; // Return null instead of false to indicate no claim attempted
-  
-  try {
-    // Normalize session ID before claiming
-    const normalizedSessionId = normalizeSessionId(sessionId);
-    const response = await httpRequest(`${webUrl}/api/auth/claim-session-with-token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: normalizedSessionId,
-        token,
-      }),
-    });
-    
-    if (response.ok) {
-      // Parse response to get auth code
-      const responseData = await response.json();
-      return responseData.authCode || null;
-    }
-    
-    return null;
-  } catch (error) {
-    return null;
-  }
-}
+// claimSession function removed - session claiming is no longer supported
+// All sessions must be created with authentication
 
 // Removed getSessionAuthCode - auth codes should only come from:
 // 1. claim-session-with-token response (for claimed sessions)
 // 2. socket.io session-auth-code event (for unclaimed sessions)
 // Never fetch auth codes via public API endpoint - security vulnerability 
 
-function printBanner(sessionId, webUrl, authCode = null) {
+function printBanner(sessionId, authCode = null) {
+  const { webUrl } = getProductionUrls();
   const dashboardUrl = authCode 
     ? `${webUrl}/${sessionId}?auth=${authCode}`
     : `${webUrl}/${sessionId}`;
@@ -392,213 +347,217 @@ function printBanner(sessionId, webUrl, authCode = null) {
   console.log('\n');
 }
 
-async function main() {
-  // Handle --version flag early (before commander parses)
-  const allArgs = process.argv;
-  const args = process.argv.slice(2);
+/**
+ * Handle init command - create a new session with parser selection
+ */
+async function handleInit(options) {
+  const { webUrl } = getProductionUrls();
   
-  // Check for --version or -V flag
-  if (allArgs.includes('--version') || allArgs.includes('-V') || args.includes('--version') || args.includes('-V')) {
-    console.log(cliVersion);
-    process.exit(0);
-  }
+  // Interactive prompt for parser selection
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
   
-  // Handle init command - check for 'init' command
-  const hasInit = allArgs.includes('init') || args.includes('init');
+  const question = (query) => new Promise((resolve) => rl.question(query, resolve));
   
-  if (hasInit) {
-    // Find init position to get args after it
-    const initIndex = args.indexOf('init');
-    const initArgs = initIndex !== -1 ? args.slice(initIndex + 1) : [];
+  try {
+    console.log('\n  🔧 vibex.sh Session Initialization\n');
     
-    // Create a separate command instance for init
-    const initCmd = new Command();
-    initCmd
-      .option('--web <url>', 'Web server URL')
-      .option('--server <url>', 'Shorthand for --web')
-      .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres)')
-      .option('--parsers <parsers>', 'Alias for --parser');
-    
-    // Parse only the options (args after 'init')
-    if (initArgs.length > 0) {
-      initCmd.parse(['node', 'vibex', ...initArgs], { from: 'user' });
-    } else {
-      initCmd.parse(['node', 'vibex'], { from: 'user' });
+    // Fetch available parsers from public API
+    let availableParsers = [];
+    try {
+      const parsersResponse = await httpRequest(`${webUrl}/api/parsers`, {
+        method: 'GET',
+      });
+      if (parsersResponse.ok) {
+        availableParsers = await parsersResponse.json();
+      } else {
+        console.warn('  ⚠️  Failed to fetch parsers from API, using fallback list');
+      }
+    } catch (e) {
+      console.warn('  ⚠️  Failed to fetch parsers from API, using fallback list');
     }
     
-    const options = initCmd.opts();
-    const { webUrl } = getUrls(options);
+    // Fallback to hardcoded list if API fails or returns empty
+    if (!availableParsers || availableParsers.length === 0) {
+      availableParsers = [
+        { id: 'nginx', name: 'Nginx Access Log', category: 'web' },
+        { id: 'apache', name: 'Apache Access Log', category: 'web' },
+        { id: 'docker', name: 'Docker Container Logs', category: 'system' },
+        { id: 'kubernetes', name: 'Kubernetes Pod/Container Logs', category: 'system' },
+      ];
+    }
     
-    // Interactive prompt for parser selection
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    // Filter out mandatory parsers for selection (if any)
+    const selectableParsers = availableParsers.filter(p => !p.isMandatory);
     
-    const question = (query) => new Promise((resolve) => rl.question(query, resolve));
-    
-    try {
-      console.log('\n  🔧 vibex.sh Session Initialization\n');
-      
-      // Fetch available parsers from worker
-      const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
-      let availableParsers = [];
-      try {
-        const parsersResponse = await httpRequest(`${workerUrl}/internal/parsers`, {
-          method: 'GET',
-          headers: {
-            'X-Internal-API-Secret': process.env.INTERNAL_API_SECRET || '',
-          },
-        });
-        if (parsersResponse.ok) {
-          availableParsers = await parsersResponse.json();
-        }
-      } catch (e) {
-        // Fallback to hardcoded list if API fails
-        availableParsers = [
-          { id: 'nginx', name: 'Nginx Access Log', category: 'web' },
-          { id: 'apache', name: 'Apache Access Log', category: 'web' },
-          { id: 'docker', name: 'Docker Container Logs', category: 'system' },
-          { id: 'kubernetes', name: 'Kubernetes Pod/Container Logs', category: 'system' },
-        ];
-      }
-      
-      // Filter out mandatory parsers for selection
-      const selectableParsers = availableParsers.filter(p => !p.isMandatory);
-      
-      console.log('  What kind of logs are these? (Optional - leave empty for auto-detection)');
+    console.log('  What kind of logs are these? (Optional - leave empty for auto-detection)');
+    if (selectableParsers.length > 0) {
       console.log('  Available log types:');
       selectableParsers.forEach((p, i) => {
         console.log(`    ${i + 1}. ${p.name} (${p.id})`);
       });
       console.log('    (Leave empty for auto-detection)\n');
-      
-      const answer = await question('  Enter comma-separated numbers or parser IDs (e.g., 1,2 or nginx,apache): ');
-      rl.close();
-      
-      let enabledParsers = [];
-      if (answer.trim()) {
-        const selections = answer.split(',').map(s => s.trim());
-        selections.forEach(sel => {
-          // Check if it's a number
-          const num = parseInt(sel, 10);
-          if (!isNaN(num) && num > 0 && num <= selectableParsers.length) {
-            enabledParsers.push(selectableParsers[num - 1].id);
-          } else if (selectableParsers.find(p => p.id === sel)) {
-            enabledParsers.push(sel);
-          }
-        });
-      }
-      
-      // Use parser flag if provided, otherwise use interactive selection
-      const parserFlag = options.parser || options.parsers;
-      if (parserFlag) {
-        if (typeof parserFlag === 'string') {
-          enabledParsers = parserFlag.split(',').map(p => p.trim());
+    } else {
+      console.log('  Available log types: (Leave empty for auto-detection)\n');
+    }
+    
+    const answer = await question('  Enter comma-separated numbers or parser IDs (e.g., 1,2 or nginx,apache): ');
+    rl.close();
+    
+    let enabledParsers = [];
+    if (answer.trim()) {
+      const selections = answer.split(',').map(s => s.trim());
+      selections.forEach(sel => {
+        // Check if it's a number
+        const num = parseInt(sel, 10);
+        if (!isNaN(num) && num > 0 && num <= selectableParsers.length) {
+          enabledParsers.push(selectableParsers[num - 1].id);
+        } else if (selectableParsers.find(p => p.id === sel)) {
+          enabledParsers.push(sel);
         }
-      }
-      
-      // Create session with enabledParsers
-      const createUrl = `${webUrl}/api/sessions/create-anonymous`;
-      const response = await httpRequest(createUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
-        }),
       });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error(`\n  ✗ Failed to create session: ${errorData.message || 'Unknown error'}`);
-        process.exit(1);
+    }
+    
+    // Use parser flag if provided, otherwise use interactive selection
+    const parserFlag = options.parser || options.parsers;
+    if (parserFlag) {
+      if (typeof parserFlag === 'string') {
+        enabledParsers = parserFlag.split(',').map(p => p.trim());
       }
-      
-      const data = await response.json();
-      const createdSessionId = data.sessionId;
-      const createdAuthCode = data.authCode;
-      
-      console.log('\n  ✅ Session created successfully!\n');
-      printBanner(createdSessionId, webUrl, createdAuthCode);
-      if (enabledParsers.length > 0) {
-        console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
-      } else {
-        console.log('  📋 Log Types: Auto-detection (all parsers)');
-      }
-      console.log(`\n  💡 Use this session ID: ${createdSessionId}`);
-      console.log(`  Example: echo '{"cpu": 45}' | npx vibex-sh -s ${createdSessionId}\n`);
-      
-      process.exit(0);
-    } catch (error) {
-      rl.close();
-      console.error(`\n  ✗ Error: ${error.message}`);
+    }
+    
+    // Get token - required for authenticated session creation
+    let token = process.env.VIBEX_TOKEN || await getStoredToken();
+    if (!token) {
+      console.error('\n  ✗ Authentication required');
+      console.error('  💡 Run: npx vibex-sh login');
       process.exit(1);
     }
-  }
-
-  // Handle login command separately - check BEFORE commander parses
-  // Check process.argv directly - look for 'login' as a standalone argument
-  // This must happen FIRST, before any commander parsing
-  // Check if 'login' appears anywhere in process.argv (works with npx too)
-  const hasLogin = allArgs.includes('login') || args.includes('login');
-  
-  if (hasLogin) {
-    // Find login position to get args after it
-    const loginIndex = args.indexOf('login');
-    const loginArgs = loginIndex !== -1 ? args.slice(loginIndex + 1) : [];
     
-    // Create a separate command instance for login
-    const loginCmd = new Command();
-    loginCmd
-      .option('--web <url>', 'Web server URL')
-      .option('--server <url>', 'Shorthand for --web');
+    // Create session with enabledParsers (authenticated)
+    const createUrl = `${webUrl}/api/sessions/create`;
+    const response = await httpRequest(createUrl, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
+      }),
+    });
     
-    // Parse only the options (args after 'login')
-    if (loginArgs.length > 0) {
-      loginCmd.parse(['node', 'vibex', ...loginArgs], { from: 'user' });
-    } else {
-      loginCmd.parse(['node', 'vibex'], { from: 'user' });
+    if (!response.ok) {
+      const errorData = await response.json();
+      if (response.status === 401 || response.status === 403) {
+        console.error(`\n  ✗ Authentication failed: ${errorData.message || 'Invalid token'}`);
+        console.error('  💡 Run: npx vibex-sh login');
+      } else {
+        console.error(`\n  ✗ Failed to create session: ${errorData.message || 'Unknown error'}`);
+      }
+      process.exit(1);
     }
     
-    const options = loginCmd.opts();
-    const { webUrl } = getUrls(options);
-    await handleLogin(webUrl);
+    const data = await response.json();
+    const createdSessionId = data.sessionId;
+    const createdAuthCode = data.authCode;
+    
+      console.log('\n  ✅ Session created successfully!\n');
+      printBanner(createdSessionId, createdAuthCode);
+    if (enabledParsers.length > 0) {
+      console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
+    } else {
+      console.log('  📋 Log Types: Auto-detection (default parsers)');
+    }
+    console.log(`\n  💡 Use this session ID: ${createdSessionId}`);
+    console.log(`  Example: echo '{"cpu": 45}' | npx vibex-sh -s ${createdSessionId}\n`);
+    
     process.exit(0);
+  } catch (error) {
+    rl.close();
+    console.error(`\n  ✗ Error: ${error.message}`);
+    process.exit(1);
   }
+}
 
+async function main() {
+  // Configure main program
   program
-    .version(cliVersion, '-v, --version', 'Display version number')
-    .option('-s, --session-id <id>', 'Reuse existing session ID')
-    .option('--web <url>', 'Web server URL')
-    .option('--socket <url>', 'Socket server URL')
-    .option('--server <url>', 'Shorthand for --web (auto-derives socket URL)')
-    .option('--token <token>', 'Authentication token (or use VIBEX_TOKEN env var)')
-    .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres). Use --parser help to see available parsers.')
-    .option('--parsers <parsers>', 'Alias for --parser')
-    .parse();
+    .name('vibex')
+    .description('vibex.sh CLI - Send logs to vibex.sh for real-time analysis')
+    .version(cliVersion, '-v, --version', 'Display version number');
 
-  const options = program.opts();
-  const { webUrl, socketUrl } = getUrls(options);
+  // Login command
+  program
+    .command('login')
+    .description('Authenticate with vibex.sh and save your token')
+    .action(async () => {
+      await handleLogin();
+      process.exit(0);
+    });
+
+  // Init command
+  program
+    .command('init')
+    .description('Create a new session with parser selection')
+    .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres)')
+    .option('--parsers <parsers>', 'Alias for --parser')
+    .action(async (options) => {
+      await handleInit(options);
+    });
+
+  // Main command (default) - send logs
+  program
+    .option('-s, --session-id <id>', 'Reuse existing session ID')
+    .option('--token <token>', 'Authentication token (or use VIBEX_TOKEN env var)')
+    .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres)')
+    .option('--parsers <parsers>', 'Alias for --parser')
+    .action(async (options) => {
+      await handleSendLogs(options);
+    });
+
+  // Parse arguments
+  program.parse();
+}
+
+/**
+ * Handle send logs command (default/main command)
+ */
+async function handleSendLogs(options) {
+  const { webUrl, socketUrl } = getProductionUrls();
   
-  // Get token from flag, env var, or stored config
+  // Get token - REQUIRED for all operations
   let token = options.token || process.env.VIBEX_TOKEN || await getStoredToken();
+  if (!token) {
+    console.error('\n  ✗ Authentication required');
+    console.error('  💡 Run: npx vibex-sh login to authenticate');
+    console.error('  💡 Or set VIBEX_TOKEN environment variable\n');
+    process.exit(1);
+  }
   
   let sessionId;
   let authCode = null;
+  
+  // Check if stdin is available (piped input)
+  const isTTY = process.stdin.isTTY;
+  const hasStdin = !isTTY;
+  
+  // If no session ID and no stdin, show usage and exit
+  if (!options.sessionId && !hasStdin) {
+    program.help();
+    process.exit(0);
+  }
   
   // If session ID is provided, use it (existing session)
   if (options.sessionId) {
     sessionId = normalizeSessionId(options.sessionId);
     
-    // If token is available, try to claim the session
-    if (token) {
-      authCode = await claimSession(sessionId, token, webUrl);
-    }
-    
     // When reusing a session, show minimal info
     console.log(`  🔍 Sending logs to session: ${sessionId}\n`);
   } else {
-    // No session ID provided - create a new anonymous session
+    // No session ID provided - create a new authenticated session
     // Check for --parser or --parsers flag for parser selection
     let enabledParsers = [];
     if (options.parser || options.parsers) {
@@ -611,10 +570,13 @@ async function main() {
     }
     
     try {
-      const createUrl = `${webUrl}/api/sessions/create-anonymous`;
+      const createUrl = `${webUrl}/api/sessions/create`;
       const response = await httpRequest(createUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({
           enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
         }),
@@ -622,7 +584,12 @@ async function main() {
       
       if (!response.ok) {
         const errorData = await response.json();
-        console.error(`  ✗ Failed to create session: ${errorData.message || 'Unknown error'}`);
+        if (response.status === 401 || response.status === 403) {
+          console.error(`  ✗ Authentication failed: ${errorData.message || 'Invalid token'}`);
+          console.error('  💡 Run: npx vibex-sh login');
+        } else {
+          console.error(`  ✗ Failed to create session: ${errorData.message || 'Unknown error'}`);
+        }
         process.exit(1);
       }
       
@@ -630,19 +597,12 @@ async function main() {
       sessionId = data.sessionId; // Server-generated unique session ID
       authCode = data.authCode; // Server-generated auth code
       
-      // If token is available, claim the session
-      if (token) {
-        const claimAuthCode = await claimSession(sessionId, token, webUrl);
-        if (claimAuthCode) {
-          authCode = claimAuthCode;
-          console.log('  ✓ Session automatically claimed to your account\n');
-        }
-      }
-      
       // Print banner for new session
-      printBanner(sessionId, webUrl, authCode);
+      printBanner(sessionId, authCode);
       if (enabledParsers.length > 0) {
         console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
+      } else {
+        console.log('  📋 Log Types: Auto-detection (default parsers)');
       }
       console.log('  💡 Tip: Use -s to send more logs to this session');
       console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionId}\n`);
@@ -791,6 +751,7 @@ async function main() {
                 if (!receivedAuthCode || receivedAuthCode !== message.data.authCode) {
                   receivedAuthCode = message.data.authCode;
                   if (isNewSession) {
+                    const { webUrl } = getProductionUrls();
                     console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
                     console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
                   }
@@ -950,21 +911,19 @@ async function main() {
 
   // Send logs via HTTP POST (non-blocking, same as SDKs)
   // Always use production Cloudflare Worker endpoint
-  // Token is optional - anonymous sessions can send logs without authentication
+  // Token is REQUIRED - all sessions must be authenticated
   // HTTP POST works independently of WebSocket - don't wait for WebSocket connection
   const sendLogViaHTTP = async (logData) => {
     try {
       // Always use production worker URL
-      const workerUrl = process.env.VIBEX_WORKER_URL || 'https://ingest.vibex.sh';
+      const workerUrl = process.env.VIBEX_WORKER_URL || DEFAULT_WORKER_URL;
       const ingestUrl = `${workerUrl}/api/v1/ingest`;
             
-      // Build headers - only include Authorization if token exists
+      // Build headers - Authorization is REQUIRED
       const headers = {
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
       };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
       
       const response = await fetch(ingestUrl, {
         method: 'POST',
@@ -1065,8 +1024,17 @@ async function main() {
     }
   };
 
-  // Start WebSocket connection
-  connectWebSocket();
+  // Only start WebSocket connection if we have stdin (piped input)
+  // Don't connect WebSocket when run without parameters
+  if (hasStdin) {
+    connectWebSocket();
+  }
+
+  // Only read from stdin if we have piped input
+  if (!hasStdin) {
+    // No stdin - exit after showing session info
+    process.exit(0);
+  }
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1145,8 +1113,10 @@ async function main() {
       reconnectTimeout = null;
     }
     
-    // Graceful shutdown - wait for close handshake
-    await closeWebSocket();
+    // Graceful shutdown - wait for close handshake (only if WebSocket was connected)
+    if (hasStdin && socket) {
+      await closeWebSocket();
+    }
     
     // Give a moment for any final cleanup
     setTimeout(() => process.exit(0), 100);
