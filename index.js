@@ -389,24 +389,38 @@ async function handleInit(options) {
       ];
     }
     
-    // Filter out mandatory parsers for selection (if any)
-    const selectableParsers = availableParsers.filter(p => !p.isMandatory);
+    // Mandatory parsers that are always included
+    const mandatoryParserIds = ['json-in-text', 'raw', 'keyvalue', 'stacktrace', 'smart-pattern'];
     
-    console.log('  What kind of logs are these? (Optional - leave empty for auto-detection)');
+    // Filter out mandatory parsers for selection (only optional parsers can be selected)
+    const selectableParsers = availableParsers.filter(p => !mandatoryParserIds.includes(p.id) && !p.isMandatory);
+    
+    // Pre-select mandatory parsers
+    let enabledParsers = [...mandatoryParserIds];
+    
+    console.log('  Mandatory parsers are automatically included:');
+    mandatoryParserIds.forEach(id => {
+      const parser = availableParsers.find(p => p.id === id);
+      if (parser) {
+        console.log(`    ✓ ${parser.name}`);
+      }
+    });
+    console.log('');
+    
+    console.log('  Select additional optional parsers (leave empty for mandatory only):');
     if (selectableParsers.length > 0) {
-      console.log('  Available log types:');
+      console.log('  Available optional parsers:');
       selectableParsers.forEach((p, i) => {
         console.log(`    ${i + 1}. ${p.name} (${p.id})`);
       });
-      console.log('    (Leave empty for auto-detection)\n');
+      console.log('    (Leave empty for mandatory parsers only)\n');
     } else {
-      console.log('  Available log types: (Leave empty for auto-detection)\n');
+      console.log('  No additional optional parsers available.\n');
     }
     
-    const answer = await question('  Enter comma-separated numbers or parser IDs (e.g., 1,2 or nginx,apache): ');
+    const answer = await question('  Enter comma-separated numbers or parser IDs (e.g., 1,2 or docker,kubernetes): ');
     rl.close();
     
-    let enabledParsers = [];
     if (answer.trim()) {
       const selections = answer.split(',').map(s => s.trim());
       selections.forEach(sel => {
@@ -424,7 +438,9 @@ async function handleInit(options) {
     const parserFlag = options.parser || options.parsers;
     if (parserFlag) {
       if (typeof parserFlag === 'string') {
-        enabledParsers = parserFlag.split(',').map(p => p.trim());
+        // Add optional parsers from flag, but always include mandatory
+        const flagParsers = parserFlag.split(',').map(p => p.trim());
+        enabledParsers = [...new Set([...mandatoryParserIds, ...flagParsers])];
       }
     }
     
@@ -466,10 +482,18 @@ async function handleInit(options) {
     
       console.log('\n  ✅ Session created successfully!\n');
       printBanner(createdSessionId, createdAuthCode);
-    if (enabledParsers.length > 0) {
-      console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
-    } else {
-      console.log('  📋 Log Types: Auto-detection (default parsers)');
+    
+    // Separate mandatory and optional parsers for display
+    const mandatoryIncluded = enabledParsers.filter(id => mandatoryParserIds.includes(id));
+    const optionalIncluded = enabledParsers.filter(id => !mandatoryParserIds.includes(id));
+    
+    if (mandatoryIncluded.length > 0) {
+      console.log(`  📋 Mandatory parsers: ${mandatoryIncluded.join(', ')}`);
+    }
+    if (optionalIncluded.length > 0) {
+      console.log(`  📋 Optional parsers: ${optionalIncluded.join(', ')}`);
+    } else if (mandatoryIncluded.length === mandatoryParserIds.length) {
+      console.log('  📋 Using mandatory parsers only');
     }
     console.log(`\n  💡 Use this session ID: ${createdSessionId}`);
     console.log(`  Example: echo '{"cpu": 45}' | npx vibex-sh -s ${createdSessionId}\n`);
