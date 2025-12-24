@@ -10,6 +10,8 @@ import https from 'https';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import crypto from 'crypto';
+import chalk from 'chalk';
+import cliProgress from 'cli-progress';
 
 // Constants
 const POLL_INTERVAL_MS = 1000;
@@ -17,6 +19,7 @@ const MAX_POLL_ATTEMPTS = 60;
 const WEBSOCKET_CLOSE_TIMEOUT_MS = 2000;
 const DEFAULT_WORKER_URL = 'https://ingest.vibex.sh';
 const DEFAULT_WEB_URL = 'https://vibex.sh';
+const PIPED_INPUT_DELAY_MS = parseInt(process.env.VIBEX_PIPE_DELAY_MS || '300', 10);
 
 // Get version from package.json
 const __filename = fileURLToPath(import.meta.url);
@@ -335,15 +338,15 @@ function printBanner(sessionId, authCode = null) {
     : `${webUrl}/${sessionId}`;
   
   console.log('\n');
-  console.log('  ╔═══════════════════════════════════════╗');
-  console.log('  ║         🔍 vibex.sh is watching...    ║');
-  console.log('  ╚═══════════════════════════════════════╝');
+  console.log(chalk.cyan('  ╔═══════════════════════════════════════╗'));
+  console.log(chalk.cyan('  ║         🔍 vibex.sh is watching...    ║'));
+  console.log(chalk.cyan('  ╚═══════════════════════════════════════╝'));
   console.log('\n');
-  console.log(`  Session ID: ${sessionId}`);
+  console.log(chalk.white(`  Session ID: ${chalk.bold(sessionId)}`));
   if (authCode) {
-    console.log(`  Auth Code:  ${authCode}`);
+    console.log(chalk.white(`  Auth Code:  ${chalk.bold(authCode)}`));
   }
-  console.log(`  Dashboard:  ${dashboardUrl}`);
+  console.log(chalk.white(`  Dashboard:  ${chalk.underline.cyan(dashboardUrl)}`));
   console.log('\n');
 }
 
@@ -579,7 +582,11 @@ async function handleSendLogs(options) {
     sessionId = normalizeSessionId(options.sessionId);
     
     // When reusing a session, show minimal info
-    console.log(`  🔍 Sending logs to session: ${sessionId}\n`);
+    if (hasStdin) {
+      console.log(chalk.cyan(`\n  🔍 Sending logs to session: ${chalk.bold(sessionId)}\n`));
+    } else {
+      console.log(chalk.cyan(`  🔍 Session: ${chalk.bold(sessionId)}\n`));
+    }
   } else {
     // No session ID provided - create a new authenticated session
     // Check for --parser or --parsers flag for parser selection
@@ -656,6 +663,32 @@ async function handleSendLogs(options) {
   // Track if this is a new session (not reusing an existing one)
   const isNewSession = !options.sessionId;
 
+  // Stats tracking for piped input (declared early so sendLogViaHTTP can access it)
+  let stats = {
+    logsRead: 0,
+    logsSent: 0,
+    logsFailed: 0,
+    startTime: Date.now(),
+  };
+
+  // Progress bar for piped input (declared early so sendLogViaHTTP can access it)
+  let progressBar = null;
+  if (hasStdin) {
+    progressBar = new cliProgress.SingleBar({
+      format: chalk.cyan('{bar}') + ' | ' + chalk.white('{percentage}%') + ' | ' + chalk.green('{value}/{total}') + ' logs sent | ' + chalk.blue('{eta}s remaining'),
+      barCompleteChar: '\u2588',
+      barIncompleteChar: '\u2591',
+      hideCursor: true,
+      clearOnComplete: false,
+      etaBuffer: 10,
+    });
+    // Start with 1 to avoid division by zero, will update as we read logs
+    progressBar.start(1, 0, {
+      value: 0,
+      total: 1,
+    });
+  }
+
   // Graceful shutdown function
   const closeWebSocket = () => {
     return new Promise((resolve) => {
@@ -669,11 +702,8 @@ async function handleSendLogs(options) {
       
       connectionState = 'closing';
       const closeStartTime = Date.now();
-      console.log('  🔄 Initiating graceful WebSocket close...');
       
       const closeTimeout = setTimeout(() => {
-        const elapsed = Date.now() - closeStartTime;
-        console.log(`  ⚠️  Close handshake timeout after ${elapsed}ms, forcing exit`);
         connectionState = 'closed';
         resolve();
       }, 2000);
@@ -683,10 +713,8 @@ async function handleSendLogs(options) {
       
       socket.onclose = (event) => {
         clearTimeout(closeTimeout);
-        const elapsed = Date.now() - closeStartTime;
         connectionState = 'closed';
         connectionEstablished = false;
-        console.log(`  ✓ WebSocket closed gracefully (code: ${event.code}, reason: ${event.reason || 'none'}, time: ${elapsed}ms)`);
         
         // Call original handler if it exists
         if (originalOnClose) {
@@ -718,31 +746,35 @@ async function handleSendLogs(options) {
       reconnectTimeout = null;
     }
     
-    connectionLock = true;
-    connectionState = 'connecting';
-    connectionStartTime = Date.now();
-    console.log('  🔄 Connecting to WebSocket...');
-    
-    try {
-      // Close existing socket if any (cleanup)
-      if (socket && socket.readyState !== WebSocket.CLOSED) {
-        try {
-          socket.close();
-        } catch (e) {
-          // Ignore errors when closing
-        }
+      connectionLock = true;
+      connectionState = 'connecting';
+      connectionStartTime = Date.now();
+      if (!hasStdin || !progressBar) {
+        console.log(chalk.blue('  🔄 Connecting to WebSocket...'));
       }
       
-      socket = new WebSocket(`${socketUrl}?sessionId=${sessionId}`);
+      try {
+        // Close existing socket if any (cleanup)
+        if (socket && socket.readyState !== WebSocket.CLOSED) {
+          try {
+            socket.close();
+          } catch (e) {
+            // Ignore errors when closing
+          }
+        }
+        
+        socket = new WebSocket(`${socketUrl}?sessionId=${sessionId}`);
 
-      socket.onopen = () => {
-        const connectTime = Date.now() - connectionStartTime;
-        connectionLock = false;
-        connectionState = 'connected';
-        isConnected = true;
-        connectionEstablished = true;
-        console.log(`  ✓ Connected to server (${connectTime}ms)\n`);
-        reconnectAttempts = 0;
+        socket.onopen = () => {
+          const connectTime = Date.now() - connectionStartTime;
+          connectionLock = false;
+          connectionState = 'connected';
+          isConnected = true;
+          connectionEstablished = true;
+          if (!hasStdin || !progressBar) {
+            console.log(chalk.green(`  ✓ Connected to server (${connectTime}ms)\n`));
+          }
+          reconnectAttempts = 0;
 
         // Join session
         socket.send(JSON.stringify({
@@ -767,7 +799,9 @@ async function handleSendLogs(options) {
 
           switch (message.type) {
             case 'join-session-ack':
-              console.log('  ✓ Joined session\n');
+              if (!hasStdin || !progressBar) {
+                console.log(chalk.green('  ✓ Joined session\n'));
+              }
               break;
 
             case 'session-auth-code':
@@ -937,7 +971,7 @@ async function handleSendLogs(options) {
   // Always use production Cloudflare Worker endpoint
   // Token is REQUIRED - all sessions must be authenticated
   // HTTP POST works independently of WebSocket - don't wait for WebSocket connection
-  const sendLogViaHTTP = async (logData) => {
+  const sendLogViaHTTP = async (logData, suppressOutput = false) => {
     try {
       // Always use production worker URL
       const workerUrl = process.env.VIBEX_WORKER_URL || DEFAULT_WORKER_URL;
@@ -959,94 +993,132 @@ async function handleSendLogs(options) {
       });
 
       if (!response.ok) {
+        stats.logsFailed++;
         const errorData = await response.json().catch(() => ({}));
         const errorMessage = errorData.message || response.statusText || 'Unknown error';
         
-        console.error(`\n  ✗ HTTP ${response.status}: ${errorMessage}`);
+        if (!suppressOutput) {
+          console.error(chalk.red(`\n  ✗ HTTP ${response.status}: ${errorMessage}`));
+        }
         
         // Handle specific error cases
         if (response.status === 401) {
-          if (errorMessage.includes('expired')) {
-            console.error('\n  🔑 Token Expired');
-            console.error('  Your authentication token has expired.');
-            console.error('  💡 Run: npx vibex-sh login');
-            console.error('');
-          } else if (errorMessage.includes('Invalid') || errorMessage.includes('invalid')) {
-            console.error('\n  🔑 Invalid Token');
-            console.error('  Your authentication token is invalid or missing.');
-            console.error('  💡 Run: npx vibex-sh login');
-            console.error('');
-          } else {
-            console.error('\n  🔑 Unauthorized');
-            console.error(`  ${errorMessage}`);
-            console.error('  💡 Run: npx vibex-sh login');
-            console.error('');
+          if (!suppressOutput) {
+            if (errorMessage.includes('expired')) {
+              console.error(chalk.yellow('\n  🔑 Token Expired'));
+              console.error('  Your authentication token has expired.');
+              console.error(chalk.cyan('  💡 Run: npx vibex-sh login'));
+              console.error('');
+            } else if (errorMessage.includes('Invalid') || errorMessage.includes('invalid')) {
+              console.error(chalk.yellow('\n  🔑 Invalid Token'));
+              console.error('  Your authentication token is invalid or missing.');
+              console.error(chalk.cyan('  💡 Run: npx vibex-sh login'));
+              console.error('');
+            } else {
+              console.error(chalk.yellow('\n  🔑 Unauthorized'));
+              console.error(`  ${errorMessage}`);
+              console.error(chalk.cyan('  💡 Run: npx vibex-sh login'));
+              console.error('');
+            }
           }
         } else if (response.status === 400) {
-          console.error('\n  📝 Bad Request');
-          console.error(`  ${errorMessage}`);
-          if (errorMessage.includes('sessionId')) {
-            console.error('  💡 Make sure you provided a valid session ID with -s or --session');
-          } else if (errorMessage.includes('logs')) {
-            console.error('  💡 Make sure you are sending valid log data');
-          }
-          console.error('');
-        } else if (response.status === 403) {
-          if (errorMessage.includes('History Limit')) {
-            console.error('\n  🚫 History Limit Reached');
+          if (!suppressOutput) {
+            console.error(chalk.yellow('\n  📝 Bad Request'));
             console.error(`  ${errorMessage}`);
-            if (errorData.upgradeRequired) {
-              console.error('  💡 Upgrade to Pro to unlock 30 days retention');
-              console.error('  🌐 Visit: https://vibex.sh/pricing');
+            if (errorMessage.includes('sessionId')) {
+              console.error(chalk.cyan('  💡 Make sure you provided a valid session ID with -s or --session'));
+            } else if (errorMessage.includes('logs')) {
+              console.error(chalk.cyan('  💡 Make sure you are sending valid log data'));
             }
             console.error('');
-          } else if (errorMessage.includes('access') || errorMessage.includes('belongs')) {
-            console.error('\n  🚫 Access Denied');
-            console.error(`  ${errorMessage}`);
-            console.error('  💡 This session belongs to another user or is not accessible');
-            console.error('  💡 Make sure you are using the correct token and session ID');
-            console.error('');
-          } else if (errorMessage.includes('archived')) {
-            console.error('\n  🚫 Session Archived');
-            console.error(`  ${errorMessage}`);
-            console.error('  💡 This session is archived and cannot accept new logs');
-            console.error('');
-          } else {
-            console.error('\n  🚫 Forbidden');
-            console.error(`  ${errorMessage}`);
-            console.error('');
+          }
+        } else if (response.status === 403) {
+          if (!suppressOutput) {
+            if (errorMessage.includes('History Limit')) {
+              console.error(chalk.yellow('\n  🚫 History Limit Reached'));
+              console.error(`  ${errorMessage}`);
+              if (errorData.upgradeRequired) {
+                console.error(chalk.cyan('  💡 Upgrade to Pro to unlock 30 days retention'));
+                console.error(chalk.cyan('  🌐 Visit: https://vibex.sh/pricing'));
+              }
+              console.error('');
+            } else if (errorMessage.includes('access') || errorMessage.includes('belongs')) {
+              console.error(chalk.yellow('\n  🚫 Access Denied'));
+              console.error(`  ${errorMessage}`);
+              console.error(chalk.cyan('  💡 This session belongs to another user or is not accessible'));
+              console.error(chalk.cyan('  💡 Make sure you are using the correct token and session ID'));
+              console.error('');
+            } else if (errorMessage.includes('archived')) {
+              console.error(chalk.yellow('\n  🚫 Session Archived'));
+              console.error(`  ${errorMessage}`);
+              console.error(chalk.cyan('  💡 This session is archived and cannot accept new logs'));
+              console.error('');
+            } else {
+              console.error(chalk.yellow('\n  🚫 Forbidden'));
+              console.error(`  ${errorMessage}`);
+              console.error('');
+            }
           }
         } else if (response.status === 404) {
-          console.error('\n  🔍 Session Not Found');
-          console.error(`  ${errorMessage}`);
-          console.error('  💡 Make sure the session ID is correct');
-          console.error('  💡 Check if the session exists in your dashboard');
-          console.error('');
-        } else if (response.status === 429) {
-          console.error('\n  ⚠️  Rate Limit Exceeded');
-          console.error(`  ${errorMessage}`);
-          if (errorData.retryAfter) {
-            console.error(`  ⏱️  Retry after: ${errorData.retryAfter} seconds`);
+          if (!suppressOutput) {
+            console.error(chalk.yellow('\n  🔍 Session Not Found'));
+            console.error(`  ${errorMessage}`);
+            console.error(chalk.cyan('  💡 Make sure the session ID is correct'));
+            console.error(chalk.cyan('  💡 Check if the session exists in your dashboard'));
+            console.error('');
           }
-          console.error('');
+        } else if (response.status === 429) {
+          if (!suppressOutput) {
+            console.error(chalk.yellow('\n  ⚠️  Rate Limit Exceeded'));
+            console.error(`  ${errorMessage}`);
+            if (errorData.retryAfter) {
+              console.error(chalk.cyan(`  ⏱️  Retry after: ${errorData.retryAfter} seconds`));
+            }
+            console.error('');
+          }
         } else if (response.status >= 500) {
-          console.error('\n  🔴 Server Error');
-          console.error(`  ${errorMessage}`);
-          console.error('  💡 This is a server-side issue. Please try again later.');
-          console.error('  💡 If the problem persists, contact support');
-          console.error('');
+          if (!suppressOutput) {
+            console.error(chalk.red('\n  🔴 Server Error'));
+            console.error(`  ${errorMessage}`);
+            console.error(chalk.cyan('  💡 This is a server-side issue. Please try again later.'));
+            console.error(chalk.cyan('  💡 If the problem persists, contact support'));
+            console.error('');
+          }
         } else {
-          console.error(`  ${errorMessage}`);
-          console.error('');
+          if (!suppressOutput) {
+            console.error(`  ${errorMessage}`);
+            console.error('');
+          }
         }
       } else {
+        stats.logsSent++;
         const result = await response.json().catch(() => ({}));
-        console.log(`  ✓ Log sent successfully (processed: ${result.processed || 1})`);
+        
+        // Update progress bar if available
+        if (progressBar && suppressOutput) {
+          const total = Math.max(stats.logsRead, 1);
+          progressBar.setTotal(total);
+          progressBar.update(stats.logsSent, {
+            value: stats.logsSent,
+            total: total,
+          });
+        } else if (!suppressOutput) {
+          console.log(chalk.green(`  ✓ Log sent successfully (processed: ${result.processed || 1})`));
+        }
       }
     } catch (error) {
-      console.error(`  ✗ Error sending log to ${ingestUrl}:`, error.message);
+      stats.logsFailed++;
+      if (!suppressOutput) {
+        console.error(chalk.red(`  ✗ Error sending log: ${error.message}`));
+      }
     }
   };
+
+  // Only read from stdin if we have piped input
+  if (!hasStdin) {
+    // No stdin - exit after showing session info
+    process.exit(0);
+  }
 
   // Only start WebSocket connection if we have stdin (piped input)
   // Don't connect WebSocket when run without parameters
@@ -1054,11 +1126,55 @@ async function handleSendLogs(options) {
     connectWebSocket();
   }
 
-  // Only read from stdin if we have piped input
-  if (!hasStdin) {
-    // No stdin - exit after showing session info
-    process.exit(0);
-  }
+  // Rate limiting queue for piped input
+  const pipedLogQueue = [];
+  let isProcessingQueue = false;
+  let queueProcessingTimeout = null;
+
+  const processPipedLogQueue = async () => {
+    if (isProcessingQueue) {
+      return;
+    }
+
+    if (pipedLogQueue.length === 0) {
+      return;
+    }
+
+    isProcessingQueue = true;
+
+    try {
+      while (pipedLogQueue.length > 0) {
+        const logData = pipedLogQueue.shift();
+        await sendLogViaHTTP(logData, true); // Suppress output for piped input
+        
+        // Wait before sending the next log (only if there are more logs in queue)
+        if (pipedLogQueue.length > 0) {
+          await new Promise(resolve => setTimeout(resolve, PIPED_INPUT_DELAY_MS));
+        }
+      }
+    } finally {
+      isProcessingQueue = false;
+    }
+  };
+
+  const queuePipedLog = (logData) => {
+    pipedLogQueue.push(logData);
+    
+    // Start processing if not already processing
+    if (!isProcessingQueue) {
+      // Clear any existing timeout
+      if (queueProcessingTimeout) {
+        clearTimeout(queueProcessingTimeout);
+        queueProcessingTimeout = null;
+      }
+      // Process queue with a small initial delay to batch rapid inputs
+      queueProcessingTimeout = setTimeout(() => {
+        processPipedLogQueue().catch((error) => {
+          console.error('  ✗ Error processing log queue:', error.message);
+        });
+      }, 10);
+    }
+  };
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1070,6 +1186,20 @@ async function handleSendLogs(options) {
     const trimmedLine = line.trim();
     if (!trimmedLine) {
       return;
+    }
+
+    // Track stats
+    stats.logsRead++;
+    
+    // Update progress bar total
+    if (progressBar) {
+      // Ensure total is at least 1 to avoid division by zero
+      const total = Math.max(stats.logsRead, 1);
+      progressBar.setTotal(total);
+      progressBar.update(stats.logsSent, {
+        value: stats.logsSent,
+        total: total,
+      });
     }
 
     let logData;
@@ -1110,13 +1240,29 @@ async function handleSendLogs(options) {
       };
     }
 
-    // Send logs via HTTP POST immediately - don't wait for WebSocket
-    // WebSocket is only for receiving logs and auth codes, not required for sending
-    sendLogViaHTTP(logData);
+    // Queue logs for rate-limited sending when input is piped
+    // This prevents overwhelming rate limits when piping large files
+    queuePipedLog(logData);
   });
 
   rl.on('close', async () => {
-    // Wait for queued logs to be sent
+    // Clear any pending queue processing timeout
+    if (queueProcessingTimeout) {
+      clearTimeout(queueProcessingTimeout);
+      queueProcessingTimeout = null;
+    }
+    
+    // Process any remaining logs in the piped queue
+    // Keep processing until queue is empty and not currently processing
+    while (pipedLogQueue.length > 0 || isProcessingQueue) {
+      await processPipedLogQueue();
+      // Small delay to allow processing to complete
+      if (pipedLogQueue.length > 0 || isProcessingQueue) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+    
+    // Wait for queued logs to be sent (WebSocket queue)
     const waitForQueue = () => {
       return new Promise((resolve) => {
         if (logQueue.length === 0) {
@@ -1129,7 +1275,33 @@ async function handleSendLogs(options) {
     
     await waitForQueue();
     
-    console.log('\n  Stream ended. Closing connection...\n');
+    // Stop progress bar and show summary
+    if (progressBar) {
+      progressBar.stop();
+      console.log(''); // New line after progress bar
+    }
+    
+    // Show summary
+    const duration = ((Date.now() - stats.startTime) / 1000).toFixed(1);
+    const { webUrl } = getProductionUrls();
+    const dashboardUrl = receivedAuthCode 
+      ? `${webUrl}/${sessionId}?auth=${receivedAuthCode}`
+      : `${webUrl}/${sessionId}`;
+    
+    console.log(chalk.cyan('  ╔═══════════════════════════════════════╗'));
+    console.log(chalk.cyan('  ║         ✓ Upload Complete              ║'));
+    console.log(chalk.cyan('  ╚═══════════════════════════════════════╝'));
+    console.log('');
+    console.log(chalk.white(`  📊 Stats:`));
+    console.log(chalk.green(`     • Logs read:    ${stats.logsRead}`));
+    console.log(chalk.green(`     • Logs sent:     ${stats.logsSent}`));
+    if (stats.logsFailed > 0) {
+      console.log(chalk.red(`     • Logs failed:   ${stats.logsFailed}`));
+    }
+    console.log(chalk.blue(`     • Duration:      ${duration}s`));
+    console.log('');
+    console.log(chalk.white(`  🔗 Dashboard: ${chalk.underline.cyan(dashboardUrl)}`));
+    console.log('');
     
     // Cancel any pending reconnection attempts
     if (reconnectTimeout) {
@@ -1147,12 +1319,26 @@ async function handleSendLogs(options) {
   });
 
   process.on('SIGINT', async () => {
-    console.log('\n  Interrupted. Closing connection...\n');
+    if (progressBar) {
+      progressBar.stop();
+    }
+    console.log(chalk.yellow('\n  ⚠️  Interrupted by user\n'));
     
     // Cancel any pending reconnection attempts
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
       reconnectTimeout = null;
+    }
+    
+    // Show partial stats if available
+    if (stats.logsRead > 0) {
+      console.log(chalk.white(`  📊 Partial stats:`));
+      console.log(chalk.green(`     • Logs read:    ${stats.logsRead}`));
+      console.log(chalk.green(`     • Logs sent:     ${stats.logsSent}`));
+      if (stats.logsFailed > 0) {
+        console.log(chalk.red(`     • Logs failed:   ${stats.logsFailed}`));
+      }
+      console.log('');
     }
     
     // Graceful shutdown
