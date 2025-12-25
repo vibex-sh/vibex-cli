@@ -1289,7 +1289,7 @@ async function handleSendLogs(options) {
       : `${webUrl}/${sessionId}`;
     
     console.log(chalk.cyan('  ╔═══════════════════════════════════════╗'));
-    console.log(chalk.cyan('  ║         ✓ Upload Complete              ║'));
+    console.log(chalk.cyan('  ║         ✓ Upload Complete             ║'));
     console.log(chalk.cyan('  ╚═══════════════════════════════════════╝'));
     console.log('');
     console.log(chalk.white(`  📊 Stats:`));
