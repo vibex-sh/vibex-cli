@@ -449,6 +449,7 @@ async function handleInit(options) {
     
     // Get token - required for authenticated session creation
     let token = process.env.VIBEX_TOKEN || await getStoredToken();
+    const tokenSource = process.env.VIBEX_TOKEN ? 'cli-env' : 'cli-config';
     if (!token) {
       console.error('\n  ✗ Authentication required');
       console.error('  💡 Run: npx vibex-sh login');
@@ -462,6 +463,7 @@ async function handleInit(options) {
       headers: { 
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
+        'X-Token-Source': tokenSource,
       },
       body: JSON.stringify({
         enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
@@ -556,7 +558,20 @@ async function handleSendLogs(options) {
   const { webUrl, socketUrl } = getProductionUrls();
   
   // Get token - REQUIRED for all operations
-  let token = options.token || process.env.VIBEX_TOKEN || await getStoredToken();
+  // Track token source for debugging
+  let token;
+  let tokenSource = 'cli-config'; // default
+  if (options.token) {
+    token = options.token;
+    tokenSource = 'cli-option';
+  } else if (process.env.VIBEX_TOKEN) {
+    token = process.env.VIBEX_TOKEN;
+    tokenSource = 'cli-env';
+  } else {
+    token = await getStoredToken();
+    tokenSource = 'cli-config';
+  }
+  
   if (!token) {
     console.error('\n  ✗ Authentication required');
     console.error('  💡 Run: npx vibex-sh login to authenticate');
@@ -602,11 +617,14 @@ async function handleSendLogs(options) {
     
     try {
       const createUrl = `${webUrl}/api/sessions/create`;
+      // Determine token source for this request
+      const requestTokenSource = options.token ? 'cli-option' : (process.env.VIBEX_TOKEN ? 'cli-env' : 'cli-config');
       const response = await httpRequest(createUrl, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,
+          'X-Token-Source': requestTokenSource,
         },
         body: JSON.stringify({
           enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
@@ -981,6 +999,7 @@ async function handleSendLogs(options) {
       const headers = {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
+        'X-Token-Source': tokenSource, // Track token origin for debugging
       };
       
       const response = await fetch(ingestUrl, {
