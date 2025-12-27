@@ -8,7 +8,6 @@ import { spawn } from 'child_process';
 import http from 'http';
 import https from 'https';
 import { fileURLToPath } from 'url';
-import WebSocket from 'ws';
 import crypto from 'crypto';
 import chalk from 'chalk';
 import cliProgress from 'cli-progress';
@@ -16,7 +15,6 @@ import cliProgress from 'cli-progress';
 // Constants
 const POLL_INTERVAL_MS = 1000;
 const MAX_POLL_ATTEMPTS = 60;
-const WEBSOCKET_CLOSE_TIMEOUT_MS = 2000;
 const DEFAULT_WORKER_URL = 'https://ingest.vibex.sh';
 const DEFAULT_WEB_URL = 'https://vibex.sh';
 const PIPED_INPUT_DELAY_MS = parseInt(process.env.VIBEX_PIPE_DELAY_MS || '300', 10);
@@ -168,11 +166,8 @@ function normalizeToHybrid(message, level, payload) {
  * CLI only supports production server
  */
 function getProductionUrls() {
-  // Always use production worker WebSocket endpoint
-  const workerUrl = process.env.VIBEX_WORKER_URL || DEFAULT_WORKER_URL;
   return {
-    webUrl: DEFAULT_WEB_URL,
-    socketUrl: workerUrl.replace('https://', 'wss://').replace('http://', 'ws://'),
+    webUrl: process.env.VIBEX_WEB_URL || DEFAULT_WEB_URL,
   };
 }
 
@@ -555,7 +550,7 @@ async function main() {
  * Handle send logs command (default/main command)
  */
 async function handleSendLogs(options) {
-  const { webUrl, socketUrl } = getProductionUrls();
+  const { webUrl } = getProductionUrls();
   
   // Get token - REQUIRED for all operations
   // Track token source for debugging
@@ -661,25 +656,8 @@ async function handleSendLogs(options) {
     }
   }
 
-  let socket = null;
-  let isConnected = false;
-  let hasJoinedSession = false;
-  const logQueue = [];
-  let reconnectTimeout = null;
-  let reconnectAttempts = 0;
-  const maxReconnectDelay = 5000;
-
-  // Connection state management
-  let connectionState = 'disconnected'; // disconnected, connecting, connected, closing, closed
-  let connectionEstablished = false;
-  let connectionLock = false;
-  let connectionStartTime = null;
-
-  // Store auth code received from socket
-  let receivedAuthCode = authCode;
-  
-  // Track if this is a new session (not reusing an existing one)
-  const isNewSession = !options.sessionId;
+  // Store auth code from session creation
+  const receivedAuthCode = authCode;
 
   // Stats tracking for piped input (declared early so sendLogViaHTTP can access it)
   let stats = {
@@ -707,288 +685,11 @@ async function handleSendLogs(options) {
     });
   }
 
-  // Graceful shutdown function
-  const closeWebSocket = () => {
-    return new Promise((resolve) => {
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        if (connectionState === 'connected' || connectionState === 'closing') {
-          connectionState = 'closed';
-        }
-        resolve();
-        return;
-      }
-      
-      connectionState = 'closing';
-      const closeStartTime = Date.now();
-      
-      const closeTimeout = setTimeout(() => {
-        connectionState = 'closed';
-        resolve();
-      }, 2000);
-      
-      // Store original onclose handler
-      const originalOnClose = socket.onclose;
-      
-      socket.onclose = (event) => {
-        clearTimeout(closeTimeout);
-        connectionState = 'closed';
-        connectionEstablished = false;
-        
-        // Call original handler if it exists
-        if (originalOnClose) {
-          originalOnClose(event);
-        }
-        
-        resolve();
-      };
-      
-      socket.close(1000, 'Stream ended');
-    });
-  };
-
-  const connectWebSocket = () => {
-    // Prevent multiple simultaneous connections
-    if (connectionLock) {
-      console.log('  ⚠️  Connection already in progress, skipping...');
-      return;
-    }
-    
-    if (connectionState === 'connected' || connectionState === 'connecting') {
-      console.log(`  ⚠️  Already ${connectionState}, skipping new connection...`);
-      return;
-    }
-    
-    // Clear any existing reconnect timeout to prevent duplicate connections
-    if (reconnectTimeout) {
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = null;
-    }
-    
-      connectionLock = true;
-      connectionState = 'connecting';
-      connectionStartTime = Date.now();
-      if (!hasStdin || !progressBar) {
-        console.log(chalk.blue('  🔄 Connecting to WebSocket...'));
-      }
-      
-      try {
-        // Close existing socket if any (cleanup)
-        if (socket && socket.readyState !== WebSocket.CLOSED) {
-          try {
-            socket.close();
-          } catch (e) {
-            // Ignore errors when closing
-          }
-        }
-        
-        socket = new WebSocket(`${socketUrl}?sessionId=${sessionId}`);
-
-        socket.onopen = () => {
-          const connectTime = Date.now() - connectionStartTime;
-          connectionLock = false;
-          connectionState = 'connected';
-          isConnected = true;
-          connectionEstablished = true;
-          if (!hasStdin || !progressBar) {
-            console.log(chalk.green(`  ✓ Connected to server (${connectTime}ms)\n`));
-          }
-          reconnectAttempts = 0;
-
-        // Join session
-        socket.send(JSON.stringify({
-          type: 'join-session',
-          sessionId,
-        }));
-
-        // Set hasJoinedSession immediately - HTTP POST doesn't need WebSocket
-        hasJoinedSession = true;
-        // Process any queued logs immediately
-        while (logQueue.length > 0) {
-          const logData = logQueue.shift();
-          // Send logs via HTTP POST (non-blocking) instead of WebSocket
-          // WebSocket is only for receiving logs
-          sendLogViaHTTP(logData);
-        }
-      };
-
-      socket.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-
-          switch (message.type) {
-            case 'join-session-ack':
-              if (!hasStdin || !progressBar) {
-                console.log(chalk.green('  ✓ Joined session\n'));
-              }
-              break;
-
-            case 'session-auth-code':
-              if (message.data && message.data.sessionId === sessionId && message.data.authCode) {
-                if (!receivedAuthCode || receivedAuthCode !== message.data.authCode) {
-                  receivedAuthCode = message.data.authCode;
-                  if (isNewSession) {
-                    const { webUrl } = getProductionUrls();
-                    console.log(`  🔑 Auth Code: ${receivedAuthCode}`);
-                    console.log(`  📋 Dashboard: ${webUrl}/${sessionId}?auth=${receivedAuthCode}\n`);
-                  }
-                }
-              }
-              break;
-
-            case 'log':
-              // Logs are received via WebSocket but sent via HTTP
-              break;
-
-            case 'error':
-              const errorType = message.error || 'Error';
-              const errorMsg = message.message || 'An unexpected error occurred';
-              const statusCode = message.statusCode || 0;
-              
-              // Handle specific error types
-              if (errorType === 'Rate Limit Exceeded' || statusCode === 429) {
-                console.error('\n  ⚠️  Rate Limit Exceeded');
-                console.error(`  ${errorMsg}`);
-                if (message.retryAfter) {
-                  console.error(`  ⏱️  Retry after: ${message.retryAfter} seconds`);
-                }
-                console.error('');
-                logQueue.length = 0;
-              } else if (errorType === 'History Limit Reached' || (statusCode === 403 && errorMsg.includes('History Limit'))) {
-                console.error('\n  🚫 History Limit Reached');
-                console.error(`  ${errorMsg}`);
-                if (message.limit !== undefined && message.current !== undefined) {
-                  console.error(`  Current: ${message.current} / ${message.limit} logs`);
-                }
-                if (message.upgradeRequired) {
-                  console.error('  💡 Upgrade to Pro to unlock 30 days retention');
-                  console.error('  🌐 Visit: https://vibex.sh/pricing');
-                }
-                console.error('');
-                logQueue.length = 0;
-                hasJoinedSession = false;
-              } else if (statusCode === 401 || errorType === 'Unauthorized') {
-                if (errorMsg.includes('expired')) {
-                  console.error('\n  🔑 Token Expired');
-                  console.error('  Your authentication token has expired.');
-                  console.error('  💡 Run: npx vibex-sh login');
-                } else {
-                  console.error('\n  🔑 Unauthorized');
-                  console.error(`  ${errorMsg}`);
-                  console.error('  💡 Run: npx vibex-sh login');
-                }
-                console.error('');
-                logQueue.length = 0;
-                hasJoinedSession = false;
-              } else if (statusCode === 403 || errorType === 'Forbidden') {
-                if (errorMsg.includes('access') || errorMsg.includes('belongs')) {
-                  console.error('\n  🚫 Access Denied');
-                  console.error(`  ${errorMsg}`);
-                  console.error('  💡 This session belongs to another user or is not accessible');
-                  console.error('  💡 Make sure you are using the correct token and session ID');
-                } else if (errorMsg.includes('archived')) {
-                  console.error('\n  🚫 Session Archived');
-                  console.error(`  ${errorMsg}`);
-                  console.error('  💡 This session is archived and cannot accept new logs');
-                } else {
-                  console.error('\n  🚫 Forbidden');
-                  console.error(`  ${errorMsg}`);
-                }
-                console.error('');
-                logQueue.length = 0;
-                hasJoinedSession = false;
-              } else if (statusCode === 404 || errorType === 'Not Found') {
-                console.error('\n  🔍 Session Not Found');
-                console.error(`  ${errorMsg}`);
-                console.error('  💡 Make sure the session ID is correct');
-                console.error('  💡 Check if the session exists in your dashboard');
-                console.error('');
-                logQueue.length = 0;
-                hasJoinedSession = false;
-              } else if (statusCode === 400 || errorType === 'Bad Request') {
-                console.error('\n  📝 Bad Request');
-                console.error(`  ${errorMsg}`);
-                if (errorMsg.includes('sessionId')) {
-                  console.error('  💡 Make sure you provided a valid session ID with -s or --session');
-                } else if (errorMsg.includes('logs')) {
-                  console.error('  💡 Make sure you are sending valid log data');
-                }
-                console.error('');
-                logQueue.length = 0;
-              } else if (statusCode >= 500 || errorType === 'Internal Server Error') {
-                console.error('\n  🔴 Server Error');
-                console.error(`  ${errorMsg}`);
-                console.error('  💡 This is a server-side issue. Please try again later.');
-                console.error('  💡 If the problem persists, contact support');
-                console.error('');
-                logQueue.length = 0;
-              } else {
-                console.error('\n  ✗ Error');
-                console.error(`  ${errorType}: ${errorMsg}`);
-                if (statusCode) {
-                  console.error(`  Status Code: ${statusCode}`);
-                }
-                console.error('');
-                logQueue.length = 0;
-              }
-              break;
-
-            default:
-              // Ignore unknown message types
-              break;
-          }
-        } catch (error) {
-          console.error('  ✗ Error parsing message:', error.message);
-        }
-      };
-
-      socket.onerror = (error) => {
-        if (!isConnected) {
-          console.error(`  ✗ Connection error: ${error.message || 'websocket error'}`);
-          console.error(`  ↻ Trying to connect to: ${socketUrl}`);
-          console.error('  ↻ Retrying connection...\n');
-        }
-      };
-
-      socket.onclose = (event) => {
-        connectionLock = false;
-        connectionState = 'closed';
-        connectionEstablished = false;
-        isConnected = false;
-        hasJoinedSession = false;
-        
-        const connectionDuration = connectionStartTime ? Date.now() - connectionStartTime : 0;
-        console.log(`  📊 Connection closed (code: ${event.code}, reason: ${event.reason || 'none'}, duration: ${connectionDuration}ms)`);
-
-        // Reconnect logic - only if not a normal closure and not already closing
-        if (event.code !== 1000 && connectionState !== 'closing') {
-          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelay);
-          reconnectAttempts++;
-          console.log(`  ↻ Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...\n`);
-          
-          reconnectTimeout = setTimeout(() => {
-            connectWebSocket();
-          }, delay);
-        } else if (event.code === 1000) {
-          console.log('  ✓ Normal closure, no reconnect needed\n');
-        }
-      };
-    } catch (error) {
-      connectionLock = false;
-      connectionState = 'disconnected';
-      connectionEstablished = false;
-      console.error(`  ✗ Error creating WebSocket: ${error.message}`);
-      console.error(`  ↻ URL: ${socketUrl}`);
-      // Retry connection
-      reconnectTimeout = setTimeout(() => {
-        connectWebSocket();
-      }, 1000);
-    }
-  };
 
   // Send logs via HTTP POST (non-blocking, same as SDKs)
   // Always use production Cloudflare Worker endpoint
   // Token is REQUIRED - all sessions must be authenticated
-  // HTTP POST works independently of WebSocket - don't wait for WebSocket connection
+  // All logs are sent via HTTP POST
   const sendLogViaHTTP = async (logData, suppressOutput = false) => {
     try {
       // Always use production worker URL
@@ -1139,12 +840,6 @@ async function handleSendLogs(options) {
     process.exit(0);
   }
 
-  // Only start WebSocket connection if we have stdin (piped input)
-  // Don't connect WebSocket when run without parameters
-  if (hasStdin) {
-    connectWebSocket();
-  }
-
   // Rate limiting queue for piped input
   const pipedLogQueue = [];
   let isProcessingQueue = false;
@@ -1281,19 +976,6 @@ async function handleSendLogs(options) {
       }
     }
     
-    // Wait for queued logs to be sent (WebSocket queue)
-    const waitForQueue = () => {
-      return new Promise((resolve) => {
-        if (logQueue.length === 0) {
-          resolve();
-        } else {
-          setTimeout(() => waitForQueue().then(resolve), 100);
-        }
-      });
-    };
-    
-    await waitForQueue();
-    
     // Stop progress bar and show summary
     if (progressBar) {
       progressBar.stop();
@@ -1322,16 +1004,6 @@ async function handleSendLogs(options) {
     console.log(chalk.white(`  🔗 Dashboard: ${chalk.underline.cyan(dashboardUrl)}`));
     console.log('');
     
-    // Cancel any pending reconnection attempts
-    if (reconnectTimeout) {
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = null;
-    }
-    
-    // Graceful shutdown - wait for close handshake (only if WebSocket was connected)
-    if (hasStdin && socket) {
-      await closeWebSocket();
-    }
     
     // Give a moment for any final cleanup
     setTimeout(() => process.exit(0), 100);
@@ -1343,12 +1015,6 @@ async function handleSendLogs(options) {
     }
     console.log(chalk.yellow('\n  ⚠️  Interrupted by user\n'));
     
-    // Cancel any pending reconnection attempts
-    if (reconnectTimeout) {
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = null;
-    }
-    
     // Show partial stats if available
     if (stats.logsRead > 0) {
       console.log(chalk.white(`  📊 Partial stats:`));
@@ -1359,9 +1025,6 @@ async function handleSendLogs(options) {
       }
       console.log('');
     }
-    
-    // Graceful shutdown
-    await closeWebSocket();
     
     process.exit(0);
   });
