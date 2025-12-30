@@ -14,7 +14,7 @@ import cliProgress from 'cli-progress';
 
 // Constants
 const POLL_INTERVAL_MS = 1000;
-const MAX_POLL_ATTEMPTS = 60;
+const MAX_POLL_ATTEMPTS = 900; // 15 minutes (was 60 seconds) - extended to accommodate signup flow
 const DEFAULT_WORKER_URL = 'https://ingest.vibex.sh';
 const DEFAULT_WEB_URL = 'https://vibex.sh';
 const PIPED_INPUT_DELAY_MS = parseInt(process.env.VIBEX_PIPE_DELAY_MS || '300', 10);
@@ -534,10 +534,8 @@ async function main() {
 
   // Main command (default) - send logs
   program
-    .option('-s, --session-id <id>', 'Reuse existing session ID')
+    .option('-s, --session-id <id>', 'Session ID (required). Run \'npx vibex-sh init\' to create a session first')
     .option('--token <token>', 'Authentication token (or use VIBEX_TOKEN env var)')
-    .option('--parser <parsers>', 'Comma-separated list of parser IDs (e.g., nginx,postgres)')
-    .option('--parsers <parsers>', 'Alias for --parser')
     .action(async (options) => {
       await handleSendLogs(options);
     });
@@ -581,82 +579,28 @@ async function handleSendLogs(options) {
   const isTTY = process.stdin.isTTY;
   const hasStdin = !isTTY;
   
-  // If no session ID and no stdin, show usage and exit
-  if (!options.sessionId && !hasStdin) {
-    program.help();
-    process.exit(0);
+  // If no session ID is provided, require explicit session creation
+  if (!options.sessionId) {
+    console.error('\n  ✗ No session ID provided\n');
+    console.error('  To create a new session with parser selection, run:');
+    console.error('    npx vibex-sh init\n');
+    console.error('  To use an existing session, provide the session ID:');
+    console.error('    echo \'{"log": "data"}\' | npx vibex-sh -s <SESSION_ID>\n');
+    console.error('  💡 Tip: Run \'npx vibex-sh init\' to choose parsers that match your log types\n');
+    process.exit(1);
   }
   
-  // If session ID is provided, use it (existing session)
-  if (options.sessionId) {
-    sessionId = normalizeSessionId(options.sessionId);
-    
-    // When reusing a session, show minimal info
-    if (hasStdin) {
-      console.log(chalk.cyan(`\n  🔍 Sending logs to session: ${chalk.bold(sessionId)}\n`));
-    } else {
-      console.log(chalk.cyan(`  🔍 Session: ${chalk.bold(sessionId)}\n`));
-    }
+  // Session ID is provided - use it (existing session)
+  sessionId = normalizeSessionId(options.sessionId);
+  
+  // When reusing a session, show minimal info
+  if (hasStdin) {
+    console.log(chalk.cyan(`\n  🔍 Sending logs to session: ${chalk.bold(sessionId)}\n`));
   } else {
-    // No session ID provided - create a new authenticated session
-    // Check for --parser or --parsers flag for parser selection
-    let enabledParsers = [];
-    if (options.parser || options.parsers) {
-      const parserList = options.parser || options.parsers;
-      if (Array.isArray(parserList)) {
-        enabledParsers = parserList;
-      } else if (typeof parserList === 'string') {
-        enabledParsers = parserList.split(',').map(p => p.trim());
-      }
-    }
-    
-    try {
-      const createUrl = `${webUrl}/api/sessions/create`;
-      // Determine token source for this request
-      const requestTokenSource = options.token ? 'cli-option' : (process.env.VIBEX_TOKEN ? 'cli-env' : 'cli-config');
-      const response = await httpRequest(createUrl, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-          'X-Token-Source': requestTokenSource,
-        },
-        body: JSON.stringify({
-          enabledParsers: enabledParsers.length > 0 ? enabledParsers : undefined,
-        }),
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        if (response.status === 401 || response.status === 403) {
-          console.error(`  ✗ Authentication failed: ${errorData.message || 'Invalid token'}`);
-          console.error('  💡 Run: npx vibex-sh login');
-        } else {
-          console.error(`  ✗ Failed to create session: ${errorData.message || 'Unknown error'}`);
-        }
-        process.exit(1);
-      }
-      
-      const data = await response.json();
-      sessionId = data.sessionId; // Server-generated unique session ID
-      authCode = data.authCode; // Server-generated auth code
-      
-      // Print banner for new session
-      printBanner(sessionId, authCode);
-      if (enabledParsers.length > 0) {
-        console.log(`  📋 Log Types: ${enabledParsers.join(', ')}`);
-      } else {
-        console.log('  📋 Log Types: Auto-detection (default parsers)');
-      }
-      console.log('  💡 Tip: Use -s to send more logs to this session');
-      console.log(`  Example: echo '{"cpu": 45, "memory": 78}' | npx vibex-sh -s ${sessionId}\n`);
-    } catch (error) {
-      console.error(`  ✗ Error creating session: ${error.message}`);
-      process.exit(1);
-    }
+    console.log(chalk.cyan(`  🔍 Session: ${chalk.bold(sessionId)}\n`));
   }
 
-  // Store auth code from session creation
+  // Auth code for session (only set when creating new sessions via init)
   const receivedAuthCode = authCode;
 
   // Stats tracking for piped input (declared early so sendLogViaHTTP can access it)
